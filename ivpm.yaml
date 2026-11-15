@@ -1,0 +1,33 @@
+package:
+  name: fw-hdl-fe-sv
+  default-dep-set: default-dev
+
+  dep-sets:
+  - name: default
+    deps:
+    - name: fw-hdl-spec
+      url: https://github.com/featherweight-hdl/fw-hdl-spec.git
+    - name: zuspec-ir-core
+      url: https://github.com/zuspec/zuspec-ir-core.git
+    - name: zuspec-fe-sv
+      url: https://github.com/zuspec/zuspec-fe-sv.git
+    - name: zuspec-synth
+      url: https://github.com/zuspec/zuspec-synth.git
+    - name: zuspec-be-sv
+      url: https://github.com/zuspec/zuspec-be-sv.git
+    - name: pyslang
+      src: pypi
+
+  - name: default-dev
+    uses: default
+    deps:
+    - name: pytest
+      src: pypi
+    - name: dv-flow-mgr
+      url: https://github.com/dv-flow/dv-flow-mgr.git
+    - name: dv-flow-libhdlsim
+      url: https://github.com/dv-flow/dv-flow-libhdlsim.git
+    - name: verilator
+      url: https://github.com/edapack/verilator-bin
+      src: gh-rls
+      cache: true

@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+# Wrapping existing RTL with fw-hdl (core layer 1). See README.md.
+#
+#   dfm run sim      elaborate, emit Verilog, simulate against chain_ref
+#   dfm run emit     just the Verilog (rundir/wrap_rtl.emit/)
+package:
+  name: wrap_rtl
+
+  tasks:
+  # The existing RTL: two modules with different pin conventions.
+  - name: rtl
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: rtl
+      include: [fw_rv_fifo.sv, axis_reg.sv]
+
+  # The fw-hdl description: wrappers and the assembly.
+  - name: design
+    uses: std.FileSet
+    with:
+      type: fwHdlSource
+      base: sv
+      include: [wrap_pkg.sv]
+
+  - name: elab
+    uses: fw.hdl.fe.sv.Elaborate
+    needs: [design, rtl]
+    with:
+      top: "wrap_pkg::chain#(bit[7:0])"
+
+  - root: emit
+    uses: fw.hdl.fe.sv.EmitSV
+    needs: [elab]
+    with:
+      top_module: chain
+
+  # The hand-wired reference and the lockstep testbench.
+  - name: tb
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: tb
+      include: [chain_ref.sv, chain_tb.sv]
+
+  - name: sim-img
+    uses: hdlsim.vlt.SimImage
+    needs: [emit, tb]
+    with:
+      top: [chain_tb]
+
+  - root: sim
+    uses: hdlsim.vlt.SimRun
+    needs: [sim-img]

@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+package:
+  name: fw.hdl.fe.sv
+  desc: fw-hdl static front end (core-layer1.md §6.7)
+  doc: |
+    Elaborate a design written against the fw-hdl SV API and emit Verilog.
+    The design's own sources are FileSets of filetype ``fwHdlSource``; any
+    ``systemVerilogSource``/``verilogSource`` input is the RTL of the
+    externs, used to check pin maps against module headers and passed on
+    to the simulator.
+
+  tasks:
+  - name: Elaborate
+    scope: export
+    desc: Elaborate an fw-hdl design to Zuspec IR and an elaborated netlist
+    consumes:
+    - filetype: fwHdlSource
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    passthrough: none
+    with:
+      top:
+        doc: The top component class, as SV type text (``pkg::chain#(bit[7:0])``)
+        type: str
+      spec:
+        doc: The fw-hdl-spec checkout (default $FW_HDL_SPEC, else $IVPM_PACKAGES/fw-hdl-spec)
+        type: str
+        value: ""
+      parameterize:
+        doc: One module per class, with parameters, where the structure allows (§6.6)
+        type: bool
+        value: true
+      require_param:
+        doc: Make a class that must be emitted per specialization an error, not a note
+        type: bool
+        value: false
+    shell: pytask
+    run: fw.hdl.fe.sv.dfm.Elaborate
+
+  - name: EmitSV
+    scope: export
+    desc: Emit Verilog from fw-hdl Zuspec IR (structural flattening, then zuspec-be-sv)
+    consumes:
+    - filetype: zuspecIR
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    passthrough: none
+    with:
+      top_module:
+        doc: The top module's name (default the top class's name)
+        type: str
+        value: ""
+    shell: pytask
+    run: fw.hdl.fe.sv.dfm.EmitSV

@@ -1,0 +1,1537 @@
+"""The elaborated design as Zuspec IR (core-layer1.md §6.3, §6.6).
+
+The output is *structural* IR: components with ports, local signals,
+bundle fields in a role, child instance fields, and ``bind_map``
+connections; externs as ``DataTypeExtern`` with their pin map. Flattening
+bundles and turning connections into nets and instances is a Zuspec pass
+(``zuspec.synth.passes.struct_flatten``), not fe-sv's job.
+
+Parameterized emission (§6.6): each component is mapped *generally* when
+it can be, i.e. one IR type per class, whatever its parameter values:
+
+- its integral type parameters, its value class parameters (a
+  struct-valued one, a *shape*, flattened: ``S.data_w`` is ``S_data_w``)
+  and the integral fields of its params struct (nested struct fields
+  joined by ``_``) are ``template_params``. A port's or bundle member's
+  type is traced as written (``fw_input #(bit [W-1:0])``): a
+  ``DataTypeRef`` to a type parameter, or a ``DataTypeInt`` whose
+  ``width_expr`` is an expression of the parameters. A bundle type is
+  generic over its own class parameters (``fw_rv_if`` with ``T``), its
+  field in a component carrying ``inst_params``;
+- each child carries ``inst_params``: the values its creator computed, and
+  the class parameters it was created with, as expressions over the
+  component's parameters and genvars. The values come from running the
+  component's code with its parameters traced (``zuspec.fe.sv.interp``
+  tracing: every parameter is a ``Sym``);
+- children, ports and bundles created in a loop over a parameter, named
+  ``base[i]``, are an array: one field ``base`` of a ``DataTypeArray`` type
+  whose ``size_expr`` is the loop bound (a child array's ``index_var`` is
+  the loop variable);
+- connections made in a loop over parameters go in a ``GenerateFor``;
+  children and connections under an ``if`` on parameters go in a
+  ``GenerateIf``, both arms. The arm that did not run at the elaborated
+  values is *explored*: the component's class is elaborated again on its
+  own, with that arm forced (``FeRt.explore``), and the runs are merged;
+  ``if``\\ s with the same condition (one in ``build()``, one in
+  ``connect()``) become one block;
+- an extern is generic over its class parameters too: its
+  ``extern_params`` are expressions over them, and its instance's
+  ``inst_params`` say what they are.
+
+A component whose structure cannot be written that way (the
+*specialization rule*: an override from a farther ancestor, a
+constructor factory that picks another realization, control flow the
+tracing cannot follow, ...) is mapped *concretely*: its parameters baked
+in, as in M4/M5. An informational diagnostic (``FW-I-EMIT-SPEC``) names
+what forced it; with ``require_param`` it is an error
+(``FW-E-EMIT-SPEC``).
+
+Equal IR types are shared. The first type made for a class takes the
+class's own name (``fifo_chain``); others get ``__1``, ``__2``.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+import zuspec.ir.core as ir
+
+from .params import to_ir as param_ir
+from zuspec.fe.sv.interp.trace import leaves
+from zuspec.fe.sv.interp.values import Sym
+
+from . import types as ty
+from .objects import (BUNDLE, MIRROR, MONITOR, Diag, FwBundle, FwComponent, FwObject,
+                      FwSignal)
+
+_ROLE = {BUNDLE: ir.BundleRole.INITIATOR, MIRROR: ir.BundleRole.MIRROR,
+         MONITOR: ir.BundleRole.MONITOR}
+
+SPEC_INFO = "FW-I-EMIT-SPEC"
+SPEC_ERROR = "FW-E-EMIT-SPEC"
+
+#: At most this many elaborations of one component (itself and the runs that
+#: explore arms of its branches).
+MAX_RUNS = 16
+
+
+class NotParam(Exception):
+    """The component cannot be mapped generally; the message says why."""
+
+
+# ----------------------------------------------------------------- types
+
+def _int_type(t) -> ir.DataTypeInt:
+    """An integral type as a ``DataTypeInt``: its width, signedness and
+    whether it is four-state (``logic``) or two-state (``bit``)."""
+    t = ty.canon(t)
+    if t is None:
+        return ir.DataTypeInt(bits=1, signed=False)
+    return ir.DataTypeInt(bits=int(t.bitWidth), signed=bool(t.isSigned),
+                          four_state=bool(getattr(t, "isFourState", True)))
+
+
+def _is_named_value_type(t) -> bool:
+    """A packed struct or an enum: an IR type of its own (§6.3)."""
+    c = ty.canon(t)
+    return bool(getattr(c, "isEnum", False)) or \
+        (bool(getattr(c, "isStruct", False)) and bool(getattr(c, "isPackedStruct",
+                                                                getattr(c, "isIntegral", False))))
+
+
+def type_params(cls) -> List[Any]:
+    """The integral type parameters of a class specialization: the ones
+    that become ``parameter type`` (in declaration order)."""
+    out = []
+    for m in ty.canon(cls):
+        if type(m).__name__ == "TypeParameterSymbol" and not m.isLocalParam:
+            if getattr(ty.canon(m.targetType.type), "isIntegral", False):
+                out.append(m)
+    return out
+
+
+def _default_type_of(cls, m):
+    """The declared default of type parameter ``m`` (a slang type), else
+    its value here."""
+    g = getattr(ty.canon(cls), "genericClass", None)
+    d = None
+    if g is not None:
+        try:
+            # pyslang binds defaultSpecialization as a property that needs
+            # the scope: call its getter.
+            d = type(g).defaultSpecialization.fget(g, g.parentScope)
+        except Exception:
+            d = None
+    if d is not None:
+        dm = ty.canon(d).find(m.name)
+        if dm is not None and type(dm).__name__ == "TypeParameterSymbol":
+            return dm.targetType.type
+    return m.targetType.type
+
+
+def _base_name(cls) -> str:
+    c = ty.canon(cls)
+    return c.genericClass.name if getattr(c, "genericClass", None) is not None else c.name
+
+
+def _port(s: FwSignal, dtype: ir.DataType, name: Optional[str] = None) -> ir.Field:
+    name = s.name if name is None else name
+    if s.dir is None:
+        return ir.Field(name=name, datatype=dtype)
+    return ir.FieldInOut(name=name, datatype=dtype, is_out=s.dir == "out",
+                         is_inout=s.dir == "inout",
+                         direction={"in": ir.SignalDirection.INPUT,
+                                    "out": ir.SignalDirection.OUTPUT,
+                                    "inout": ir.SignalDirection.INOUT}[s.dir])
+
+
+# ------------------------------------------------------------- expressions
+
+def _ekey(e) -> Any:
+    """A structural key of an expression or type (for type interning and for
+    comparing loop iterations and runs)."""
+    if e is None:
+        return None
+    if isinstance(e, ir.ExprConstant):
+        return ["c", e.value, e.width]
+    if isinstance(e, ir.ExprRefParam):
+        return ["p", e.name]
+    if isinstance(e, ir.ExprRefLocal):
+        return ["g", e.name]
+    if isinstance(e, ir.ExprRefUnresolved):
+        return ["u", e.name]
+    if isinstance(e, ir.ExprBin):
+        return ["bin", e.op.name, _ekey(e.lhs), _ekey(e.rhs)]
+    if isinstance(e, ir.ExprCompare):
+        return ["cmp", [o.name for o in e.ops], _ekey(e.left), [_ekey(x) for x in e.comparators]]
+    if isinstance(e, ir.ExprBool):
+        return ["bool", e.op.name, [_ekey(x) for x in e.values]]
+    if isinstance(e, ir.ExprUnary):
+        return ["un", e.op.name, _ekey(e.operand)]
+    if isinstance(e, ir.ExprIfExp):
+        return ["if", _ekey(e.test), _ekey(e.body), _ekey(e.orelse)]
+    if isinstance(e, ir.ExprCall):
+        return ["call", _ekey(e.func), [_ekey(x) for x in e.args]]
+    if isinstance(e, ir.ExprAttribute):
+        return ["attr", _ekey(e.value), e.attr]
+    if isinstance(e, ir.ExprStaticRef):
+        return ["sref", e.is_global, list(e.path)]
+    if isinstance(e, ir.ExprHierarchical):
+        return ["path", [[el.name, _ekey(el.subscript)] for el in e.elements]]
+    if isinstance(e, ir.DataTypeRef):
+        return ["tref", e.ref_name]
+    if isinstance(e, ir.DataTypeInt):
+        return ["int", e.bits if e.width_expr is None else None, e.signed, _ekey(e.width_expr),
+                e.four_state]
+    if isinstance(e, ir.DataTypeArray):
+        return ["arr", _ekey(e.element_type),
+                e.size if e.size_expr is None else None, _ekey(e.size_expr)]
+    if isinstance(e, ir.Bind):
+        return ["bind", _ekey(e.lhs), _ekey(e.rhs)]
+    if isinstance(e, ir.GenerateFor):
+        return ["for", e.var, _ekey(e.start), _ekey(e.cond), e.label,
+                [_ekey(x) for x in e.items]]
+    if isinstance(e, ir.GenerateIf):
+        return ["gif", _ekey(e.cond), e.label, [_ekey(x) for x in e.items],
+                [_ekey(x) for x in e.orelse]]
+    if isinstance(e, ir.Field):
+        return _field_key(e)
+    raise TypeError(f"no key for {type(e).__name__}")
+
+
+def cond_key(e) -> Tuple[str, bool]:
+    """A key of a branch condition that is the same in every run (leaves by
+    name), and whether it is negated: ``!c`` keys as ``c``, negated."""
+    neg = False
+    while isinstance(e, ir.ExprUnary) and e.op == ir.UnaryOp.Not:
+        neg = not neg
+        e = e.operand
+    return json.dumps(_ekey(e), sort_keys=True), neg
+
+
+def _field_key(f) -> list:
+    return [type(f).__name__, f.name, _ekey(f.datatype), getattr(f, "is_out", None),
+            getattr(f, "is_inout", None), f.role.name if f.role else None,
+            {k: _ekey(v) for k, v in f.inst_params.items()}, f.index_var]
+
+
+def _eval(e, env: Dict[int, int]) -> Optional[int]:
+    """The concrete value of a traced expression, its leaves valued by
+    ``env`` (``id(leaf)`` -> int); None if it cannot be computed."""
+    if isinstance(e, ir.ExprConstant):
+        return e.value if isinstance(e.value, int) else None
+    if id(e) in env:
+        return env[id(e)]
+    try:
+        if isinstance(e, ir.ExprBin):
+            a, b = _eval(e.lhs, env), _eval(e.rhs, env)
+            if a is None or b is None:
+                return None
+            return {ir.BinOp.Add: lambda: a + b, ir.BinOp.Sub: lambda: a - b,
+                    ir.BinOp.Mult: lambda: a * b, ir.BinOp.Div: lambda: a // b,
+                    ir.BinOp.Mod: lambda: a % b}.get(e.op, lambda: None)()
+        if isinstance(e, ir.ExprUnary) and e.op == ir.UnaryOp.USub:
+            a = _eval(e.operand, env)
+            return None if a is None else -a
+        if isinstance(e, ir.ExprIfExp):
+            t = _eval(e.test, env)
+            return None if t is None else _eval(e.body if t else e.orelse, env)
+        if isinstance(e, ir.ExprCompare):
+            a, b = _eval(e.left, env), _eval(e.comparators[0], env)
+            if a is None or b is None:
+                return None
+            return int({ir.CmpOp.Eq: a == b, ir.CmpOp.NotEq: a != b, ir.CmpOp.Lt: a < b,
+                        ir.CmpOp.LtE: a <= b, ir.CmpOp.Gt: a > b,
+                        ir.CmpOp.GtE: a >= b}[e.ops[0]])
+        if isinstance(e, ir.ExprBool):
+            vs = [_eval(x, env) for x in e.values]
+            if any(v is None for v in vs):
+                return None
+            return int(all(vs) if e.op == ir.BoolOp.And else any(vs))
+    except (ZeroDivisionError, KeyError):
+        return None
+    return None
+
+
+def _subscripts(e) -> List[Tuple[str, Any]]:
+    """``(array name, index)`` of every subscript in a traced handle path
+    (``u[i+1].in`` -> ``[("u", i+1)]``), outermost first."""
+    out = []
+    if isinstance(e, ir.ExprSubscript):
+        out += _subscripts(e.value)
+        v = e.value
+        while isinstance(v, ir.ExprAttribute):
+            v = v.value
+        name = e.value.attr if isinstance(e.value, ir.ExprAttribute) else \
+            (v.name if isinstance(v, ir.ExprRefUnresolved) else None)
+        out.append((name, e.slice))
+    elif isinstance(e, ir.ExprAttribute):
+        out += _subscripts(e.value)
+    return out
+
+
+def _norm(e, tr):
+    """``e`` with each member read of a shape (``ExprAttribute`` chains on a
+    struct leaf of ``tr``, an ``objects.Traced``) replaced by the leaf of
+    that field: ``S.data_w`` -> ``S_data_w`` (§6.6)."""
+    if e is None or tr is None:
+        return e
+    if isinstance(e, ir.ExprAttribute):
+        path = []
+        x = e
+        while isinstance(x, ir.ExprAttribute):
+            path.append(x.attr)
+            x = x.value
+        hit = tr.sleaves.get(id(x))
+        if hit is not None:
+            leaf = hit[1].get(tuple(reversed(path)))
+            if leaf is not None:
+                return leaf
+        return ir.ExprAttribute(value=_norm(e.value, tr), attr=e.attr)
+    if isinstance(e, ir.ExprBin):
+        return ir.ExprBin(lhs=_norm(e.lhs, tr), op=e.op, rhs=_norm(e.rhs, tr))
+    if isinstance(e, ir.ExprCompare):
+        return ir.ExprCompare(left=_norm(e.left, tr), ops=list(e.ops),
+                              comparators=[_norm(x, tr) for x in e.comparators])
+    if isinstance(e, ir.ExprBool):
+        return ir.ExprBool(op=e.op, values=[_norm(x, tr) for x in e.values])
+    if isinstance(e, ir.ExprUnary):
+        return ir.ExprUnary(op=e.op, operand=_norm(e.operand, tr))
+    if isinstance(e, ir.ExprIfExp):
+        return ir.ExprIfExp(test=_norm(e.test, tr), body=_norm(e.body, tr),
+                            orelse=_norm(e.orelse, tr))
+    if isinstance(e, ir.ExprCall):
+        return ir.ExprCall(func=e.func, args=[_norm(x, tr) for x in e.args])
+    if isinstance(e, ir.ExprSubscript):
+        return ir.ExprSubscript(value=_norm(e.value, tr), slice=_norm(e.slice, tr))
+    return e
+
+
+def _check(e, tr, genvars, what: str, owner: str):
+    """``e`` as an expression over the parameters of the object traced by
+    ``tr`` and the genvars of the frames in ``genvars`` (shape members
+    resolved, :func:`_norm`); NotParam if it is not one."""
+    if e is None:
+        raise NotParam(f"{what} is not an expression of {owner}'s parameters")
+    e = _norm(e, tr)
+    ok = {id(f.leaf) for f in genvars}
+    for x in leaves(e):
+        if id(x) not in tr.leaves and id(x) not in ok:
+            raise NotParam(f"{what} is not an expression of {owner}'s parameters")
+    return e
+
+
+def _check_type(dt, tr, what: str, owner: str):
+    """A traced type (``TType.ir``) in the terms of ``tr``'s object."""
+    if isinstance(dt, ir.DataTypeInt) and dt.width_expr is not None:
+        return ir.DataTypeInt(bits=dt.bits, signed=dt.signed, four_state=dt.four_state,
+                              width_expr=_check(dt.width_expr, tr, (), what, owner))
+    return dt
+
+
+_ELEM = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)\[(\d+)\]")
+_FMT = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)\[%0?d\]")
+
+
+# ------------------------------------------------------------------ mapper
+
+class _Scope:
+    """What is in scope while mapping one component (one run of it)
+    generally."""
+
+    def __init__(self, c: FwComponent):
+        self.c = c
+        # Arrays (children, ports, bundles made in a loop over parameters):
+        # base name -> {"key": the loop's frame key, "size": size Expr,
+        # "kind": "child" | "port"}.
+        self.arrays: Dict[str, dict] = {}
+        # Concrete values of the leaves, to check traced indices against.
+        self.env: Dict[int, int] = {}
+        vals = {flat: _get(c.params, path) for flat, path, _ in c.mparams}
+        vals.update({flat: v for flat, _p, _t, v in c.tr.cparams})
+        for lid, name in c.leaves.items():
+            if name in vals and isinstance(vals[name], int):
+                self.env[lid] = vals[name]
+
+    def check(self, e, genvars, what: str):
+        return _check(e, self.c.tr, genvars, what, self.c.path)
+
+
+def _get(v, path):
+    for p in path:
+        v = v[p]
+    return v
+
+
+def _loops(ctx) -> tuple:
+    return tuple(x[0] for x in ctx if x[0].kind == "loop")
+
+
+# Region tree of one component's structure: what was created and connected
+# in which loop iteration and branch arm (keyed so that runs and iterations
+# can be merged).
+
+class _Block:
+    """A region: ``items`` by key, in order: ``("f", name)`` a Field,
+    ``("e", base)`` an array element (an _Elem), ``("b", key)`` a Bind,
+    ``("loop", frame key)`` a _Loop, ``("if", frame key)`` an _If."""
+
+    def __init__(self):
+        self.items: Dict[tuple, Any] = {}
+        self.frames: Dict[tuple, int] = {}       # frame key -> id(frame) seen here
+
+
+class _Loop:
+    def __init__(self, f, start, cond):
+        self.f = f
+        self.start = start
+        self.cond = cond
+        self.count = f.count
+        self.iters: Dict[int, _Block] = {}
+        self.need = False                         # ran no iteration, body has effects
+
+
+class _If:
+    def __init__(self, f, cond, why: str):
+        self.f = f
+        self.cond = cond                          # checked, or None (why says why)
+        self.why = why
+        self.arms: Dict[bool, Optional[_Block]] = {True: None, False: None}
+        self.need: Dict[bool, bool] = {True: False, False: False}
+
+
+class _Elem:
+    """An element of an array, in one iteration: ``sig`` keys the element's
+    type and parameters (equal in every iteration); ``make(size)`` makes the
+    array's field."""
+
+    def __init__(self, ks, sig, make, kind):
+        self.ks = set(ks)
+        self.sig = sig
+        self.make = make
+        self.kind = kind
+
+
+def _same(a, b, where: str) -> None:
+    if json.dumps(_ekey(a), sort_keys=True) != json.dumps(_ekey(b), sort_keys=True):
+        raise NotParam(where)
+
+
+def _merge(a: Optional[_Block], b: Optional[_Block], where: str) -> Optional[_Block]:
+    """Two runs (or two loop iterations) of one region, as one. Everything
+    but the arms of branches and the iterations of loops must be equal."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if list(a.items) != list(b.items) and set(a.items) != set(b.items):
+        diff = sorted(str(k) for k in set(a.items) ^ set(b.items))
+        raise NotParam(f"{where} differ in what they create or connect ({diff[0]})")
+    out = _Block()
+    out.frames = dict(a.frames)
+    for k, x in a.items.items():
+        y = b.items[k]
+        if isinstance(x, _Loop):
+            m = _Loop(x.f, x.start, x.cond)
+            _same(x.start, y.start, f"the start of the loop at {x.f.where} differs")
+            _same(x.cond, y.cond, f"the bound of the loop at {x.f.where} differs")
+            m.count = x.count
+            m.need = x.need or y.need
+            for i in sorted(set(x.iters) | set(y.iters)):
+                m.iters[i] = _merge(x.iters.get(i), y.iters.get(i), where)
+            out.items[k] = m
+        elif isinstance(x, _If):
+            m = _If(x.f, x.cond if x.cond is not None else y.cond, x.why or y.why)
+            if x.cond is not None and y.cond is not None:
+                _same(x.cond, y.cond, f"the condition at {x.f.where} differs")
+            for arm in (True, False):
+                m.arms[arm] = _merge(x.arms[arm], y.arms[arm], where)
+                m.need[arm] = x.need[arm] or y.need[arm]
+            out.items[k] = m
+        elif isinstance(x, _Elem):
+            if json.dumps(x.sig, sort_keys=True) != json.dumps(y.sig, sort_keys=True):
+                raise NotParam(f"the elements of {k[1]}[] differ in type or parameters")
+            out.items[k] = _Elem(x.ks | y.ks, x.sig, x.make, x.kind)
+        else:
+            _same(x, y, f"{where} differ in {k[1]}")
+            out.items[k] = x
+    return out
+
+
+class IrMapper:
+    def __init__(self, rt, parameterize: bool = True, require_param: bool = False):
+        self.rt = rt
+        self.parameterize = parameterize
+        self.require_param = require_param
+        self.ctxt = ir.Context()
+        self.diags: List[Diag] = []
+        self._sig: Dict[str, str] = {}        # structural key -> type name
+        self._names: Dict[str, int] = {}
+        self.type_of: Dict[int, str] = {}     # id(FwComponent) -> type name
+        self.generic: Dict[str, bool] = {}    # type name -> has template parameters
+        self._diag_keys: set = set()
+        self._vtypes: Dict[str, str] = {}     # value type signature -> type_m key
+        self._anon = 0
+
+    def run(self) -> Tuple[ir.Context, str]:
+        return self.ctxt, self._component(self.rt.top)
+
+    # -- types --------------------------------------------------------------
+    def _type(self, t) -> ir.DataType:
+        """A concrete type (a slang type): a packed struct or enum as a
+        ``DataTypeRef`` to its IR type (:meth:`_value_type`), any other
+        integral type as a ``DataTypeInt``."""
+        if t is not None and _is_named_value_type(t):
+            return ir.DataTypeRef(ref_name=self._value_type(t))
+        return _int_type(t)
+
+    def _value_type(self, t) -> str:
+        """The ``type_m`` key of packed struct or enum ``t``, mapped (once)
+        to a ``DataTypeStruct`` (``packed``) or ``DataTypeEnum``. Keyed by
+        its package-qualified name (``prm_pkg::cfg_t``); an anonymous one,
+        or a second type of the same name, gets a key of its own.
+
+        A typedef of a package that the extern RTL declares too is that
+        package's type: ``extern_name`` is set, so it is referred to, not
+        declared again (a copy would not be the RTL port's type). Declared
+        differently there, it is an error (``FW-E-EXT-TYPE``)."""
+        from zuspec.fe.sv.module_header import type_signature
+        from .params import _qual
+        q = _qual(t)
+        c = ty.canon(t)
+        sig = f"{q}|{type_signature(c)}"
+        if sig in self._vtypes:
+            return self._vtypes[sig]
+        if q:
+            key, n = q, 0
+            while key in self.ctxt.type_m:
+                n += 1
+                key = f"{q}#{n}"
+        else:
+            self._anon += 1
+            key = f"{'enum' if getattr(c, 'isEnum', False) else 'struct'}_{self._anon}_t"
+        self._vtypes[sig] = key
+        if getattr(c, "isEnum", False):
+            from zuspec.fe.sv.interp.values import const_to_py
+            items = {m.name: const_to_py(m.value, c) for m in c
+                     if type(m).__name__ == "EnumValueSymbol"}
+            vt = ir.DataTypeEnum(name=key, items=items, width=int(c.bitWidth),
+                                 base_type=_int_type(c.baseType))
+        else:
+            fields = [ir.Field(name=m.name, datatype=self._type(m.type)) for m in c
+                      if type(m).__name__ == "FieldSymbol"]
+            vt = ir.DataTypeStruct(name=key, super=None, packed=True, fields=fields)
+        self.ctxt.type_m[key] = vt
+        if q:
+            hdrs = getattr(self.rt, "headers", None)
+            rtl_sig = hdrs.declared_type(q) if hdrs is not None else None
+            if rtl_sig is not None:
+                if rtl_sig == type_signature(c):
+                    vt.extern_name = q
+                else:
+                    self.diags.append(Diag("FW-E-EXT-TYPE", q,
+                                           f"the extern RTL declares {q} differently "
+                                           f"({rtl_sig}, here {type_signature(c)})"))
+        return key
+
+    def _ir_type(self, raw, scope_cls) -> ir.DataType:
+        """A type as seen in ``scope_cls``'s code: ``DataTypeRef(T)`` if it
+        is (follows from) ``scope_cls``'s type parameter ``T``, else
+        concrete."""
+        if scope_cls is not None:
+            name = ty.type_param_name(raw, scope_cls)
+            if name is not None:
+                return ir.DataTypeRef(ref_name=name)
+        return self._type(raw)
+
+    def _default_type(self, cls, m) -> ir.DataType:
+        """The declared default of type parameter ``m``, else its value
+        here."""
+        return self._type(_default_type_of(cls, m))
+
+    # -- bundles ----------------------------------------------------------
+    def _bundle_type(self, b: FwBundle, generic: bool = True) -> str:
+        """A bundle type, generic over its own class parameters when
+        ``generic`` (members whose type is written over one are typed by
+        it). NotParam when a member's type cannot be written so."""
+        scope = b if generic else None
+        fields: List[ir.Field] = []
+        for ch in b.children.values():
+            if isinstance(ch, FwBundle):
+                fields.append(self._bundle_field(ch, scope))
+            else:
+                fields.append(_port(ch, self._sig_type(ch, scope)))
+        tps = self._class_tparams(b.btype, b.tr) if generic else []
+        t = ir.DataTypeBundle(name=b.btype_name, super=None, fields=fields,
+                              template_params=tps)
+        base = _base_name(b.btype) if generic else b.btype_name
+        return self._intern(base, t, "bundle")
+
+    def _bundle_field(self, b: FwBundle, o, genvars=(), name: Optional[str] = None,
+                      array: Optional[ir.DataTypeArray] = None) -> ir.Field:
+        """The field of bundle ``b`` in the code of ``o`` (a component or
+        bundle traced generally; None: concretely)."""
+        try:
+            tname = self._bundle_type(b, True)
+            inst = self._class_inst(b, b.btype, b.tr.cparams, o, genvars)
+        except NotParam:
+            tname = self._bundle_type(b, False)
+            if o is not None and b.targs is not None and b.targs.traced:
+                raise NotParam(f"the type of bundle {b.path} cannot be written over "
+                               f"the parameters of {o.path}")
+            inst = {}
+        dt = ir.DataTypeRef(ref_name=tname)
+        if array is not None:
+            dt = ir.DataTypeArray(element_type=dt, size=array.size, size_expr=array.size_expr)
+        return ir.Field(name=b.name if name is None else name, datatype=dt,
+                        role=_ROLE[b.kind], inst_params=inst)
+
+    def _sig_type(self, s: FwSignal, o) -> ir.DataType:
+        """The type of signal ``s`` in the code of ``o`` (None: concrete)."""
+        if o is None:
+            return self._type(s.dtype)
+        cls = o.btype if isinstance(o, FwBundle) else o.cls
+        tt = s.ttype
+        if tt is not None:
+            if tt.tainted:
+                raise NotParam(f"the type of {s.path} cannot be written over the parameters "
+                               f"of {o.path}")
+            if tt.ir is not None:
+                return _check_type(tt.ir, o.tr, f"the type of {s.path}", o.path)
+        return self._ir_type(s.dtype, cls)
+
+    # -- class parameters --------------------------------------------------
+    def _class_tparams(self, cls, tr) -> List[ir.TemplateParam]:
+        """Template parameters for the class parameters of ``cls``: its
+        integral type parameters and its value class parameters (shapes
+        flattened), in declaration order. Defaults are the values here."""
+        out: List[ir.TemplateParam] = []
+        for m in ty.canon(cls):
+            k = type(m).__name__
+            if k == "TypeParameterSymbol" and not m.isLocalParam and \
+                    getattr(ty.canon(m.targetType.type), "isIntegral", False):
+                out.append(ir.TemplateParamType(name=m.name, kind=ir.TemplateParamKind.TYPE,
+                                                default_value=self._default_type(cls, m)))
+            elif k == "ParameterSymbol" and not m.isLocalParam and m.isPortParam:
+                for flat, path, t, v in tr.cparams:
+                    if path[0] == m.name:
+                        out.append(ir.TemplateParamValue(
+                            name=flat, kind=ir.TemplateParamKind.VALUE,
+                            value_type=_int_type(t), default_value=ir.ExprConstant(value=int(v))))
+        return out
+
+    def _class_inst(self, obj, cls, cparams, o, genvars=()) -> Dict[str, Any]:
+        """The values ``obj`` (a child or bundle, created as ``cls``) was
+        given for its class parameters, in the terms of ``o`` (the object
+        whose code created it; None: concretely)."""
+        out: Dict[str, Any] = {}
+        tt = obj.targs
+        if o is not None and tt is not None and tt.tainted:
+            raise NotParam(f"the class of {obj.path} cannot be written over the parameters "
+                           f"of {o.path}")
+        args = tt.args if tt is not None and tt.args is not None else None
+        ocls = None if o is None else (o.btype if isinstance(o, FwBundle) else o.cls)
+        if o is not None and args is not None and tt.traced:
+            # A parameter left to its default is its class's value there,
+            # unless the default is computed from the parameters passed.
+            for m in ty.canon(cls):
+                k = type(m).__name__
+                if k not in ("ParameterSymbol", "TypeParameterSymbol") or m.isLocalParam \
+                        or not m.isPortParam or m.name in args:
+                    continue
+                if _default_names_params(m, cls):
+                    raise NotParam(f"class parameter {m.name} of {obj.path} is left to its "
+                                   f"default, which is computed from the others")
+        for m in type_params(cls):
+            raw = ty.type_param(cls, m.name, raw=True)
+            a = args.get(m.name) if args is not None else None
+            if o is None:
+                out[m.name] = self._type(raw)
+            elif a is not None and a.tainted:
+                raise NotParam(f"the type parameter {m.name} of {obj.path} cannot be "
+                               f"written over the parameters of {o.path}")
+            elif a is not None and a.ir is not None:
+                out[m.name] = _check_type(a.ir, o.tr, f"type parameter {m.name} of {obj.path}",
+                                          o.path)
+            else:
+                out[m.name] = self._ir_type(raw, ocls)
+        for flat, path, _t, v in cparams:
+            if o is None:
+                out[flat] = ir.ExprConstant(value=int(v))
+                continue
+            if args is None:
+                if o.tr.leaves or getattr(o, "mparams", None):
+                    raise NotParam(f"the class parameters of {obj.path} cannot be traced "
+                                   f"(it is not created by naming its class)")
+                out[flat] = ir.ExprConstant(value=int(v))
+                continue
+            a = args.get(path[0])
+            if not isinstance(a, Sym):
+                out[flat] = ir.ExprConstant(value=int(v))
+                continue
+            e = a.expr
+            if e is not None:
+                for p in path[1:]:
+                    e = ir.ExprAttribute(value=e, attr=p)
+            out[flat] = _check(e, o.tr, genvars, f"class parameter {flat} of {obj.path}",
+                               o.path)
+        return out
+
+    # -- components -------------------------------------------------------
+    def _component(self, c: FwComponent) -> str:
+        if id(c) in self.type_of:
+            return self.type_of[id(c)]
+        for ch in c.children.values():
+            if isinstance(ch, FwComponent):
+                self._component(ch)
+        if c.is_extern:
+            name = self._extern(c)
+        else:
+            t, why = None, None
+            if self.parameterize:
+                try:
+                    t = self._general(c)
+                except NotParam as e:
+                    why = str(e)
+            if t is None:
+                t = self._concrete(c)
+            name = self._intern(_base_name(c.cls), t, "component")
+            if why is not None:
+                self._spec(c, name, why)
+            elif self.parameterize and name != _base_name(c.cls):
+                self._spec(c, name, "its structure differs from the other instances of "
+                           f"{_base_name(c.cls)} (constructor factories that pick other "
+                           f"realizations)", info=True)
+        self.type_of[id(c)] = name
+        return name
+
+    def _spec(self, c: FwComponent, name: str, why: str, info: bool = False) -> None:
+        msg = f"emitted as a specialization ({name}): {why}"
+        key = (c.path, msg)
+        if key in self._diag_keys:
+            return
+        self._diag_keys.add(key)
+        if self.require_param and not info:
+            self.diags.append(Diag(SPEC_ERROR, c.path, msg))
+        else:
+            self.diags.append(Diag(SPEC_INFO, c.path, msg, "info"))
+
+    def _template_params(self, c: FwComponent) -> List[ir.TemplateParam]:
+        tps = self._class_tparams(c.cls, c.tr)
+        for flat, path, t in c.mparams:
+            d = _get(c.params_dflt, path) if c.params_dflt is not None else _get(c.params, path)
+            tps.append(ir.TemplateParamValue(name=flat, kind=ir.TemplateParamKind.VALUE,
+                                             value_type=_int_type(t),
+                                             default_value=ir.ExprConstant(value=int(d))))
+        names = [tp.name for tp in tps]
+        if len(set(names)) != len(names):
+            raise NotParam(f"two module parameters would have the same name ({names})")
+        return tps
+
+    def _inst_params(self, ch: FwComponent, sc: Optional[_Scope], genvars) -> Dict[str, Any]:
+        """What ``ch``'s creator passes for ``ch``'s template parameters."""
+        tname = self.type_of[id(ch)]
+        o = sc.c if sc is not None else None
+        if not self.generic.get(tname):
+            if sc is not None:
+                # A specialized child: its values must not depend on ours.
+                if ch.targs is not None and ch.targs.traced:
+                    raise NotParam(f"child {ch.name} is specialized ({tname}) but its class "
+                                   f"is written over our parameters")
+                if ch.targs is None:
+                    for v in self._class_inst(ch, ch.cls, [], o).values():
+                        if isinstance(v, ir.DataTypeRef):
+                            raise NotParam(f"child {ch.name} is specialized but its type "
+                                           f"parameter {v.ref_name} is ours")
+                for flat, e in ch.param_exprs.items():
+                    if e is None or any(True for _ in leaves(e)):
+                        raise NotParam(f"child {ch.name} is specialized ({tname}) but its "
+                                       f"parameter {flat} depends on ours")
+            return {}
+        out = self._class_inst(ch, ch.cls, ch.tr.cparams, o, genvars)
+        for flat, path, _t in ch.mparams:
+            if sc is None:
+                out[flat] = ir.ExprConstant(value=int(_get(ch.params, path)))
+            else:
+                out[flat] = sc.check(ch.param_exprs.get(flat), genvars,
+                                     f"the value of {ch.path}'s parameter {flat}")
+        return out
+
+    # -- concrete (per specialization) -------------------------------------
+    def _concrete(self, c: FwComponent) -> ir.DataTypeComponent:
+        fields: List[ir.Field] = []
+        for ch in c.children.values():
+            if isinstance(ch, FwSignal):
+                fields.append(_port(ch, self._type(ch.dtype)))
+            elif isinstance(ch, FwBundle):
+                fields.append(self._bundle_field(ch, None))
+            elif isinstance(ch, FwComponent):
+                fields.append(ir.Field(name=ch.name,
+                                       datatype=ir.DataTypeRef(ref_name=self.type_of[id(ch)]),
+                                       inst_params=self._inst_params(ch, None, ())))
+        t = ir.DataTypeComponent(name=c.type_name, super=None, fields=fields)
+        for conn in c.conns:
+            t.bind_map.append(ir.Bind(lhs=self._path(conn.a, c), rhs=self._path(conn.b, c)))
+        for tie in c.ties:
+            t.bind_map.append(ir.Bind(lhs=self._path(tie.sig, c),
+                                      rhs=ir.ExprConstant(value=tie.value, width=tie.sig.width)))
+        return t
+
+    def _arrays_of(self, o) -> set:
+        """The array fields (by name) of a component's IR type."""
+        if not isinstance(o, FwComponent) or id(o) not in self.type_of:
+            return set()
+        t = self.ctxt.type_m.get(self.type_of[id(o)])
+        if t is None:
+            return set()
+        return {f.name for f in t.fields if isinstance(f.datatype, ir.DataTypeArray)}
+
+    def _path(self, o: FwObject, scope: FwComponent) -> ir.ExprHierarchical:
+        """The path to ``o`` from ``scope``; an element of a child's array
+        port (the child mapped generally) is a constant subscript."""
+        elems = []
+        cur = scope
+        for name in o.rel_path(scope):
+            m = _ELEM.fullmatch(name)
+            nxt = cur.children.get(name) if cur is not None else None
+            if m is not None and cur is not scope and m.group(1) in self._arrays_of(cur):
+                elems.append(ir.ExprHierarchicalElem(
+                    name=m.group(1), subscript=ir.ExprConstant(value=int(m.group(2)))))
+            else:
+                elems.append(ir.ExprHierarchicalElem(name=name))
+            cur = nxt
+        return ir.ExprHierarchical(elements=elems)
+
+    # -- general (parameterized) -------------------------------------------
+    def _general(self, c: FwComponent) -> ir.DataTypeComponent:
+        tps = self._template_params(c)
+        tree = self._explore(c)
+        labels = [0]
+        root = self._emit(tree, labels, True)
+        fields = [x for x in root if isinstance(x, ir.Field)]
+        names: Dict[str, int] = {}
+        for f in fields:
+            if f.name in names:
+                raise NotParam(f"'{f.name}' names two fields of {c.path}")
+            names[f.name] = 1
+        root = _sink_binds(root, set(), _cond_children(root))
+        t = ir.DataTypeComponent(name=c.type_name, super=None, fields=fields)
+        t.template_params = tps
+        t.bind_map = [x for x in root if isinstance(x, ir.Bind)]
+        t.generates = [x for x in root if isinstance(x, (ir.GenerateFor, ir.GenerateIf))]
+        _check_names(t)
+        return t
+
+    def _explore(self, c: FwComponent) -> _Block:
+        """The region tree of ``c``: its own run, merged with runs that take
+        the arms of its traced ``if``\\ s that did not run (and may have
+        effects), until every arm is covered."""
+        runs = [(c, {})]
+        seen = {frozenset()}
+        tree = None
+        i = 0
+        while i < len(runs):
+            r, force = runs[i]
+            t = self._tree(r)
+            tree = _merge(tree, t, "the arms of the branches on parameters")
+            for f in r.frames:
+                if f.kind != "if" or not f.unexplored or f.forced or f.cond is None:
+                    continue
+                if any(x.kind == "opaque" for x, _ in f.outer):
+                    continue
+                ck, neg = cond_key(f.cond)
+                if ck in force:
+                    continue
+                # Assume the condition has the other value: every if on it
+                # (or on its negation) takes the other arm.
+                f2 = dict(force)
+                f2[ck] = (not f.taken) != neg
+                k = frozenset(f2.items())
+                if k in seen:
+                    continue
+                seen.add(k)
+                if len(runs) >= MAX_RUNS:
+                    raise NotParam(f"more than {MAX_RUNS} combinations of branch arms on "
+                                   f"parameters to explore")
+                top, errs = self.rt.explore(r, f2)
+                if top is None or errs:
+                    why = str(errs[0]) if errs else "no component"
+                    raise NotParam(f"the arm of the branch on parameters at {f.where} that did not run "
+                                   f"cannot be elaborated at the values seen ({why})")
+                runs.append((top, f2))
+            i += 1
+        return tree
+
+    def _tree(self, c: FwComponent) -> _Block:
+        """The region tree of one run of ``c``."""
+        for ch in c.children.values():
+            if isinstance(ch, FwComponent):
+                self._component(ch)
+        sc = _Scope(c)
+        for f in c.frames:
+            if f.kind == "opaque" and f.unexplored:
+                raise NotParam(f"{f.reason} ({f.where})")
+            if f.irregular and f.unexplored:
+                raise NotParam(f"a loop or branch on parameters is left early ({f.where})")
+        self._pre_arrays(sc)
+        root = _Block()
+        # Objects, in creation order.
+        for ch in c.children.values():
+            self._place_object(sc, root, ch)
+        # Connections and ties.
+        for conn in c.conns:
+            b = ir.Bind(lhs=self._sym_path(sc, conn.a, conn.a_sym, conn.ctx),
+                        rhs=self._sym_path(sc, conn.b, conn.b_sym, conn.ctx))
+            blk = self._block(sc, root, conn.ctx)
+            blk.items.setdefault(("b", json.dumps(_ekey(b))), b)
+        for tie in c.ties:
+            g = _loops(tie.ctx)
+            if tie.value_sym is not None:
+                rhs = sc.check(tie.value_sym.expr, g, f"the tie value of {tie.sig.path}")
+            else:
+                rhs = ir.ExprConstant(value=tie.value, width=tie.sig.width)
+            b = ir.Bind(lhs=self._sym_path(sc, tie.sig, tie.sig_sym, tie.ctx), rhs=rhs)
+            blk = self._block(sc, root, tie.ctx)
+            blk.items.setdefault(("b", json.dumps(_ekey(b))), b)
+        # Every traced frame has its region, even with nothing in it: an arm
+        # that ran and made nothing is covered.
+        for f in c.frames:
+            if any(x.kind == "opaque" for x, _ in f.outer) or f.kind == "opaque":
+                continue
+            ctx = tuple((x, it, x.value, x.taken) for x, it in f.outer)
+            ctx += ((f, 0 if f.kind == "loop" else f.iteration, f.value, f.taken),)
+            if f.kind == "loop":
+                blk = self._block(sc, root, ctx[:-1])
+                node = self._loop_node(sc, blk, f, _loops(ctx[:-1]))
+                if f.count == 0 and f.unexplored:
+                    node.need = True
+            else:
+                self._block(sc, root, ctx)
+                blk = self._block(sc, root, ctx[:-1])
+                node = blk.items[("if", f.key)]
+                if f.unexplored:
+                    node.need[not f.taken] = True
+        return root
+
+    def _pre_arrays(self, sc: _Scope) -> None:
+        """Find the arrays: objects created in a traced loop and named
+        ``base[<loop variable>]``."""
+        c = sc.c
+        for ch in c.children.values():
+            if not ch.ctx or ch.ctx[-1][0].kind != "loop":
+                continue
+            f, _k, v, _t = ch.ctx[-1]
+            if ch.name_sym is None:
+                raise NotParam(f"{ch.path} is created in a loop over parameters but its name "
+                               f"does not depend on the loop")
+            base = self._array_base(ch, f)
+            if ch.name != f"{base}[{v}]":
+                raise NotParam(f"{ch.path}: an array element must be named "
+                               f"{base}[<loop index>]")
+            kind = "child" if isinstance(ch, FwComponent) else "port"
+            a = sc.arrays.get(base)
+            if a is None:
+                size = _array_size(f)
+                if size is None:
+                    raise NotParam(f"the loop creating {base}[] ({f.where}) does not count "
+                                   f"from 0 to a bound")
+                size = sc.check(size, (), f"the size of {base}[]")
+                sc.arrays[base] = {"key": f.key, "size": size, "kind": kind, "frame": f}
+            elif a["key"] != f.key or a["kind"] != kind:
+                raise NotParam(f"the elements of {base}[] are not made by one loop")
+
+    def _block(self, sc: _Scope, root: _Block, ctx) -> _Block:
+        """The region of ``ctx`` (traced frames, outermost first), made if
+        need be."""
+        blk = root
+        done = []
+        for f, k, v, taken in ctx:
+            if f.kind == "opaque":
+                raise NotParam(f"{f.reason} ({f.where})")
+            seen = blk.frames.get(f.key)
+            if seen is not None and seen != id(f):
+                raise NotParam(f"the {'loop' if f.kind == 'loop' else 'branch'} at {f.where} "
+                               f"runs more than once in the same place")
+            blk.frames[f.key] = id(f)
+            if f.kind == "loop":
+                node = self._loop_node(sc, blk, f, tuple(done))
+                blk = node.iters.setdefault(k, _Block())
+                done.append(f)
+            else:
+                node = blk.items.get(("if", f.key))
+                if node is None:
+                    cond, why = None, ""
+                    if f.cond is None:
+                        why = f"the condition at {f.where} is not an expression of parameters"
+                    else:
+                        try:
+                            cond = sc.check(f.cond, tuple(done), f"the condition at {f.where}")
+                        except NotParam as e:
+                            why = str(e)
+                    node = blk.items[("if", f.key)] = _If(f, cond, why)
+                arm = node.arms[bool(taken)]
+                if arm is None:
+                    arm = node.arms[bool(taken)] = _Block()
+                blk = arm
+        return blk
+
+    def _loop_node(self, sc: _Scope, blk: _Block, f, outer) -> _Loop:
+        node = blk.items.get(("loop", f.key))
+        if node is None:
+            start = sc.check(f.start, outer, f"the start of the loop at {f.where}")
+            cond = sc.check(f.cond, outer + (f,), f"the bound of the loop at {f.where}")
+            node = blk.items[("loop", f.key)] = _Loop(f, start, cond)
+        return node
+
+    def _place_object(self, sc: _Scope, root: _Block, ch: FwObject) -> None:
+        c = sc.c
+        if not ch.ctx:
+            if ch.name_sym is not None:
+                raise NotParam(f"the name of {ch.path} is computed from parameters")
+            root.items[("f", ch.name)] = self._field_of(sc, ch, ())
+            return
+        last = ch.ctx[-1][0]
+        if last.kind == "loop":
+            f, k, _v, _t = ch.ctx[-1]
+            base = _ELEM.fullmatch(ch.name).group(1)
+            a = sc.arrays[base]
+            if not isinstance(ch, FwComponent) and len(ch.ctx) != 1:
+                raise NotParam(f"{ch.path}: a port array is made in a loop under other control "
+                               f"on parameters")
+            genvars = _loops(ch.ctx)
+            if isinstance(ch, FwComponent):
+                tname = self.type_of[id(ch)]
+                ip = self._inst_params(ch, sc, genvars)
+                sig = [tname, {n: _ekey(x) for n, x in ip.items()}]
+
+                def make(size, base=base, tname=tname, ip=ip, f=f):
+                    return ir.Field(name=base, datatype=ir.DataTypeArray(
+                        element_type=ir.DataTypeRef(ref_name=tname), size=f.count,
+                        size_expr=size), index_var=f.var, inst_params=ip)
+            else:
+                proto = self._field_of(sc, ch, genvars, name=base)
+                sig = _field_key(proto)
+
+                def make(size, ch=ch, base=base, f=f, genvars=genvars):
+                    arr = ir.DataTypeArray(element_type=None, size=f.count, size_expr=size)
+                    return self._field_of(sc, ch, genvars, name=base, array=arr)
+            blk = self._block(sc, root, ch.ctx)
+            key = ("e", base)
+            prev = blk.items.get(key)
+            if prev is not None:
+                raise NotParam(f"{base}[] has two elements in one iteration")
+            blk.items[key] = _Elem({k}, sig, make, "child" if isinstance(ch, FwComponent)
+                                   else "port")
+            return
+        # Under a branch (and no loop): a child in a generate if.
+        if not isinstance(ch, FwComponent):
+            raise NotParam(f"{ch.path} is a port or signal created under a condition on "
+                           f"parameters")
+        if _loops(ch.ctx):
+            raise NotParam(f"{ch.path} is created under a condition in a loop over parameters")
+        if ch.name_sym is not None:
+            raise NotParam(f"the name of {ch.path} is computed from parameters")
+        blk = self._block(sc, root, ch.ctx)
+        blk.items[("f", ch.name)] = self._field_of(sc, ch, ())
+
+    def _field_of(self, sc: _Scope, ch: FwObject, genvars, name: Optional[str] = None,
+                  array: Optional[ir.DataTypeArray] = None) -> ir.Field:
+        c = sc.c
+        if isinstance(ch, FwComponent):
+            return ir.Field(name=ch.name if name is None else name,
+                            datatype=ir.DataTypeRef(ref_name=self.type_of[id(ch)]),
+                            inst_params=self._inst_params(ch, sc, genvars))
+        if isinstance(ch, FwSignal):
+            dt = self._sig_type(ch, c)
+            if array is not None:
+                dt = ir.DataTypeArray(element_type=dt, size=array.size,
+                                      size_expr=array.size_expr)
+            return _port(ch, dt, name)
+        return self._bundle_field(ch, c, genvars, name=name, array=array)
+
+    # -- emission of the region tree ----------------------------------------
+    def _emit(self, blk: Optional[_Block], labels, root: bool) -> List[Any]:
+        """The IR items of a region: Fields, Binds and generate blocks."""
+        out: List[Any] = []
+        if blk is None:
+            return out
+        fields, rest = [], []
+        for key, x in blk.items.items():
+            if key[0] == "f":
+                fields.append(x)
+            elif key[0] == "b":
+                rest.append(x)
+            elif key[0] == "e":
+                raise NotParam(f"{key[1]}[] is made outside a loop")
+            elif key[0] == "loop":
+                fs, gs = self._emit_loop(x, labels, root)
+                fields.extend(fs)
+                rest.extend(gs)
+            else:
+                rest.extend(self._emit_if(x, labels))
+        return fields + _merge_ifs(rest)
+
+    def _emit_loop(self, node: _Loop, labels, root: bool):
+        f = node.f
+        if not node.iters:
+            if node.need:
+                raise NotParam(f"a loop on parameters ({f.where}) has code that did not run "
+                               f"at the elaborated values")
+            return [], []
+        body = None
+        for k in sorted(node.iters):
+            body = _merge(body, node.iters[k], f"the iterations of the loop at {f.where}")
+        fields, rest = [], _Block()
+        for key, x in body.items.items():
+            if key[0] == "e":
+                if sorted(x.ks) != list(range(node.count)):
+                    raise NotParam(f"the loop creating {key[1]}[] ({f.where}) does not "
+                                   f"create one element per iteration")
+                if x.kind == "port" and not root:
+                    raise NotParam(f"port array {key[1]}[] is made under a condition")
+                fields.append(x.make(self._size_of(key[1], node)))
+            else:
+                rest.items[key] = x
+        items = self._emit(rest, labels, False)
+        gens = []
+        if items:
+            if any(isinstance(x, ir.Field) for x in items):
+                raise NotParam(f"a child is created in the loop at {f.where} that is not "
+                               f"an element of an array")
+            labels[0] += 1
+            gens.append(ir.GenerateFor(var=f.var, start=node.start, cond=node.cond,
+                                       label=f"g_{labels[0]}", items=items))
+        return fields, gens
+
+    @staticmethod
+    def _size_of(base: str, node: _Loop):
+        """The size of the array made by ``node``: from its bound."""
+        s = _array_size(node.f)
+        if s is None:
+            raise NotParam(f"the loop creating {base}[] ({node.f.where}) does not count "
+                           f"from 0 to a bound")
+        # The bound as checked (the frame's own leaves are the run's).
+        c = node.cond
+        if isinstance(c, ir.ExprCompare) and len(c.ops) == 1:
+            if c.ops[0] == ir.CmpOp.Lt:
+                return c.comparators[0]
+            if c.ops[0] == ir.CmpOp.LtE:
+                return ir.ExprBin(lhs=c.comparators[0], op=ir.BinOp.Add,
+                                  rhs=ir.ExprConstant(value=1))
+            if c.ops[0] == ir.CmpOp.Gt:
+                return c.left
+            if c.ops[0] == ir.CmpOp.GtE:
+                return ir.ExprBin(lhs=c.left, op=ir.BinOp.Add, rhs=ir.ExprConstant(value=1))
+        raise NotParam(f"the loop creating {base}[] ({node.f.where}) does not count "
+                       f"from 0 to a bound")
+
+    def _emit_if(self, node: _If, labels) -> List[Any]:
+        for arm in (True, False):
+            if node.arms[arm] is None and node.need[arm]:
+                raise NotParam(f"a branch on parameters ({node.f.where}) has code that did "
+                               f"not run at the elaborated values")
+        labels[0] += 1
+        label = f"g_{labels[0]}"
+        items = self._emit(node.arms[True], labels, False)
+        orelse = self._emit(node.arms[False], labels, False)
+        if not items and not orelse:
+            return []
+        if node.cond is None:
+            raise NotParam(node.why or f"the branch at {node.f.where} cannot be a generate if")
+        return [ir.GenerateIf(cond=node.cond, label=label, items=items, orelse=orelse)]
+
+    @staticmethod
+    def _array_base(ch: FwObject, f) -> str:
+        ns = ch.name_sym
+        e = ns.expr if ns is not None else None
+        if not (isinstance(e, ir.ExprCall) and e.func.name == "$sformatf" and len(e.args) == 2
+                and isinstance(e.args[0], ir.ExprConstant) and e.args[1] is f.leaf):
+            raise NotParam(f"{ch.path} is created in a loop over parameters but not named "
+                           f"$sformatf(\"<name>[%0d]\", <loop index>)")
+        m = _FMT.fullmatch(str(e.args[0].value))
+        if m is None:
+            raise NotParam(f"{ch.path}: an array element must be named "
+                           f"\"<name>[%0d]\"")
+        return m.group(1)
+
+    def _sym_path(self, sc: _Scope, o: FwObject, sym, ctx) -> ir.ExprHierarchical:
+        """The path to ``o`` from the component, with array subscripts (the
+        component's own arrays, or a child's array ports) written as the
+        traced index expressions."""
+        genvars = _loops(ctx)
+        if sym is not None and sym.expr is None:
+            raise NotParam(f"{o.path} is selected in a way the tracing cannot follow")
+        subs = _subscripts(sym.expr) if sym is not None else []
+        used = [False] * len(subs)
+        env = dict(sc.env)
+        for f, _k, v, _t in ctx:
+            if f.kind == "loop":
+                env[id(f.leaf)] = v
+        elems = []
+        cur = sc.c
+        arrays = set(sc.arrays)
+        for name in o.rel_path(sc.c):
+            nxt = cur.children.get(name) if cur is not None else None
+            m = _ELEM.fullmatch(name)
+            if m is None or m.group(1) not in arrays:
+                elems.append(ir.ExprHierarchicalElem(name=name))
+            else:
+                base, k = m.group(1), int(m.group(2))
+                idx = None
+                for j, (sname, sx) in enumerate(subs):
+                    if not used[j] and sname == base and _eval(sx, env) == k:
+                        idx = sc.check(sx, genvars, f"the index of {o.path}")
+                        used[j] = True
+                        break
+                if idx is None:
+                    if subs:
+                        raise NotParam(f"cannot tell how {o.path} was selected")
+                    idx = ir.ExprConstant(value=k)
+                elems.append(ir.ExprHierarchicalElem(name=base, subscript=idx))
+            arrays = self._arrays_of(nxt)
+            cur = nxt
+        for j, (sname, _sx) in enumerate(subs):
+            if not used[j]:
+                raise NotParam(f"{o.path} is selected through '{sname}' by a traced index")
+        return ir.ExprHierarchical(elements=elems)
+
+    # -- externs ----------------------------------------------------------
+    def _extern(self, c: FwComponent) -> str:
+        rec = c.extern
+        t = None
+        if self.parameterize and not rec.ctl and not c.frames:
+            try:
+                t = self._extern_type(c, True)
+            except NotParam:
+                t = None
+        if t is None:
+            t = self._extern_type(c, False)
+        return self._intern(_base_name(c.cls), t, "extern")
+
+    def _extern_type(self, c: FwComponent, general: bool) -> ir.DataTypeExtern:
+        rec = c.extern
+        sc = _Scope(c) if general else None
+        o = c if general else None
+        fields: List[ir.Field] = []
+        for ch in c.children.values():
+            if isinstance(ch, FwSignal):
+                fields.append(_port(ch, self._sig_type(ch, o)))
+            elif isinstance(ch, FwBundle):
+                fields.append(self._bundle_field(ch, o))
+        params: Dict[str, ir.Expr] = {}
+        for k, arg in rec.params.items():
+            s = arg.value
+            if general and arg.kind == "value" and isinstance(s, Sym):
+                params[k] = sc.check(s.expr, (), f"extern parameter {k}")
+            elif general and arg.kind == "type" and arg.ttype is not None and arg.ttype.traced:
+                if arg.ttype.tainted or arg.ttype.ir is None:
+                    raise NotParam(f"the type of extern parameter {k} cannot be written over "
+                                   f"the parameters of {c.path}")
+                params[k] = _check_type(arg.ttype.ir, c.tr, f"extern parameter {k}", c.path)
+            else:
+                params[k] = param_ir(arg, self._type)
+        pins = []
+        hdr = rec.header
+        for p, what, v, w in rec.resolved:
+            if what == "port":
+                pins.append(ir.ExternPin(name=p, path=v.rel_path(v.scope)))
+            elif what == "tie":
+                s = rec.tie_syms.get(p)
+                if general and isinstance(s, Sym):
+                    e = sc.check(s.expr, (), f"the tie of pin {p}")
+                else:
+                    e = ir.ExprConstant(value=v, width=w or 0)
+                pins.append(ir.ExternPin(name=p, tie=e))
+            else:
+                hp = hdr.port(p) if hdr is not None else None
+                pins.append(ir.ExternPin(name=p, open=True, datatype=_open_pin_type(
+                    hp, hdr, params, general, f"open pin {p} of {c.path}")))
+        t = ir.DataTypeExtern(name=c.type_name, super=None, fields=fields,
+                              extern_name=rec.module, extern_params=params, pins=pins)
+        if general:
+            t.template_params = self._template_params(c)
+        return t
+
+    # -- interning --------------------------------------------------------
+    def _intern(self, base: str, t, kind: str) -> str:
+        """The name of ``t``: an equal type already made is reused. The first
+        type of a class takes the class's own name, so the module emitted
+        for it does too (§6.6); later ones get ``__1``, ``__2``."""
+        key = json.dumps([kind, base, _key(t)], sort_keys=True)
+        if key in self._sig:
+            return self._sig[key]
+        n = self._names.get(base, 0)
+        while True:
+            name = base if n == 0 else f"{base}__{n}"
+            n += 1
+            if name not in self.ctxt.type_m:
+                break
+        self._names[base] = n
+        t.name = name
+        self.ctxt.type_m[name] = t
+        self._sig[key] = name
+        self.generic[name] = bool(getattr(t, "template_params", None))
+        return name
+
+
+def _open_pin_type(hp, hdr, params: Dict[str, Any], general: bool,
+                   what: str) -> Optional[ir.DataType]:
+    """The type of an open pin (``hp``, a module_header.HeaderPort), for
+    the net it is connected to: as wide as the pin. In a type mapped
+    generally (``general``), a width over the module's parameters is
+    written over the extern's (``params``: the module parameter values the
+    extern sets), NotParam if it cannot be. None without a header."""
+    if hp is None:
+        return None
+    if hp.type_param:
+        v = params.get(hp.type_param)
+        if isinstance(v, ir.DataType):
+            return v
+        return ir.DataTypeInt(bits=hp.width, signed=hp.signed)
+    if not general:
+        return ir.DataTypeInt(bits=hp.width, signed=hp.signed)
+    e = _module_expr(hp.width_expr, hdr, params, 0)
+    if e is None:
+        raise NotParam(f"the width of {what} cannot be written over its parameters")
+    if not _has_refs(e):
+        return ir.DataTypeInt(bits=hp.width, signed=hp.signed)
+    return ir.DataTypeInt(bits=hp.width, signed=hp.signed, width_expr=e)
+
+
+def _module_expr(e, hdr, params: Dict[str, Any], depth: int):
+    """``e`` (over a module's parameters, from its header) over the values
+    the extern gives them: a parameter it sets is that value; any other,
+    or a localparam, its initializer, likewise. None if it cannot be."""
+    if e is None or depth > 16:
+        return None
+    if isinstance(e, ir.ExprRefParam):
+        if e.name in params:
+            v = params[e.name]
+            return v if isinstance(v, ir.Expr) and not isinstance(v, ir.ExprStaticRef) \
+                and not (isinstance(v, ir.ExprConstant) and not isinstance(v.value, int)) \
+                else None
+        return _module_expr(hdr.param_exprs.get(e.name), hdr, params, depth + 1)
+    if isinstance(e, ir.ExprConstant):
+        return e
+    if isinstance(e, ir.ExprBin):
+        a = _module_expr(e.lhs, hdr, params, depth)
+        b = _module_expr(e.rhs, hdr, params, depth)
+        return None if a is None or b is None else ir.ExprBin(lhs=a, op=e.op, rhs=b)
+    if isinstance(e, ir.ExprUnary):
+        a = _module_expr(e.operand, hdr, params, depth)
+        return None if a is None else ir.ExprUnary(op=e.op, operand=a)
+    if isinstance(e, ir.ExprCall):
+        args = [_module_expr(x, hdr, params, depth) for x in e.args]
+        return None if any(x is None for x in args) else ir.ExprCall(func=e.func, args=args)
+    return None
+
+
+def _has_refs(e) -> bool:
+    """Whether ``e`` may depend on a parameter (anything but constants
+    combined by operators and calls)."""
+    if isinstance(e, ir.ExprConstant):
+        return False
+    if isinstance(e, ir.ExprBin):
+        return _has_refs(e.lhs) or _has_refs(e.rhs)
+    if isinstance(e, ir.ExprUnary):
+        return _has_refs(e.operand)
+    if isinstance(e, ir.ExprCall):
+        return any(_has_refs(x) for x in e.args)
+    return True
+
+
+def _default_names_params(m, cls) -> bool:
+    """Whether the default of class parameter ``m`` of ``cls`` (as declared)
+    names another parameter of ``cls``."""
+    if type(m).__name__ == "TypeParameterSymbol":
+        syn = getattr(m.targetType, "typeSyntax", None)
+    else:
+        syn = getattr(m.declaredType, "initializerSyntax", None)
+    if syn is None:
+        return False
+    c = ty.canon(cls)
+    found = [False]
+
+    def visit(n):
+        if getattr(n, "kind", None) is not None and n.kind.name == "IdentifierName":
+            x = c.find(n.identifier.valueText)
+            if x is not None and type(x).__name__ in ("ParameterSymbol", "TypeParameterSymbol") \
+                    and x.name != m.name:
+                found[0] = True
+        return True
+    try:
+        syn.visit(visit)
+    except Exception:                     # pragma: no cover - be safe
+        return True
+    return found[0]
+
+
+def _merge_ifs(items: List[Any]) -> List[Any]:
+    """Sibling generate ifs on the same condition (or its negation) as one
+    block: an ``if`` in ``build()`` and one in ``connect()`` on the same
+    parameter make the children and the connections of one arm."""
+    out: List[Any] = []
+    by_cond: Dict[str, ir.GenerateIf] = {}
+    for x in items:
+        if not isinstance(x, ir.GenerateIf):
+            out.append(x)
+            continue
+        neg = isinstance(x.cond, ir.ExprUnary) and x.cond.op == ir.UnaryOp.Not
+        k = json.dumps(_ekey(x.cond.operand if neg else x.cond), sort_keys=True)
+        g = by_cond.get(k)
+        items_, orelse = (x.orelse, x.items) if neg else (x.items, x.orelse)
+        if g is None:
+            if neg:
+                x = ir.GenerateIf(cond=x.cond.operand, label=x.label, items=items_,
+                                  orelse=orelse)
+            by_cond[k] = x
+            out.append(x)
+        else:
+            g.items = g.items + items_
+            g.orelse = g.orelse + orelse
+    return out
+
+
+def _cond_children(items, inside: bool = False) -> set:
+    """The names of the children declared in generate ifs."""
+    out = set()
+    for x in items:
+        if isinstance(x, ir.Field) and inside:
+            out.add(x.name)
+        elif isinstance(x, ir.GenerateIf):
+            out |= _cond_children(x.items, True) | _cond_children(x.orelse, True)
+        elif isinstance(x, ir.GenerateFor):
+            out |= _cond_children(x.items, inside)
+    return out
+
+
+def _declares(items, name: str) -> bool:
+    for x in items:
+        if isinstance(x, ir.Field) and x.name == name:
+            return True
+        if isinstance(x, ir.GenerateIf) and (_declares(x.items, name) or
+                                             _declares(x.orelse, name)):
+            return True
+    return False
+
+
+def _bind_names(b: ir.Bind) -> set:
+    return {side.elements[0].name for side in (b.lhs, b.rhs)
+            if isinstance(side, ir.ExprHierarchical) and side.elements}
+
+
+def _sink_binds(items: List[Any], visible: set, cond: set) -> List[Any]:
+    """Each connection to a child declared in generate ifs moved into the
+    arms that declare it: ``if (p) u = A::create("u"); else u =
+    B::create("u");`` with ``u.in.connect_up(in)`` made after the branch
+    connects whichever ``u`` the arm has. An arm without the child is not
+    in the structural subset."""
+    here = visible | {x.name for x in items if isinstance(x, ir.Field)}
+    out: List[Any] = []
+    for x in items:
+        if not isinstance(x, ir.Bind):
+            out.append(x)
+            continue
+        missing = sorted(n for n in _bind_names(x) if n in cond and n not in here)
+        if not missing:
+            out.append(x)
+            continue
+        gifs = [g for g in items if isinstance(g, ir.GenerateIf)
+                and all(_declares(g.items, n) or _declares(g.orelse, n) for n in missing)]
+        if len(gifs) != 1:
+            raise NotParam(f"a connection to {missing[0]} is made where {missing[0]} may not "
+                           f"exist")
+        g = gifs[0]
+        for arm in (g.items, g.orelse):
+            if not all(_declares(arm, n) for n in missing):
+                raise NotParam(f"a connection to {missing[0]} is made after a branch on "
+                               f"parameters with an arm that does not create it")
+            arm.append(x)
+    for x in out:
+        if isinstance(x, ir.GenerateIf):
+            x.items = _sink_binds(x.items, here, cond)
+            x.orelse = _sink_binds(x.orelse, here, cond)
+        elif isinstance(x, ir.GenerateFor):
+            for b in x.items:
+                if isinstance(b, ir.Bind) and any(n in cond and n not in here
+                                                  for n in _bind_names(b)):
+                    raise NotParam(f"a connection in the loop {x.label} is made to a child "
+                                   f"that may not exist")
+            x.items = _sink_binds(x.items, here, cond)
+    return out
+
+
+def _check_names(t: ir.DataTypeComponent) -> None:
+    """Every field, inside generate blocks too, has a name of its own,
+    except in arms of a generate if that exclude each other."""
+    seen: Dict[str, List[tuple]] = {}
+
+    def add(name, arms):
+        for other in seen.get(name, []):
+            d = dict(other)
+            if not any(g in d and d[g] != a for g, a in arms):
+                raise NotParam(f"'{name}' names two fields")
+        seen.setdefault(name, []).append(arms)
+
+    for f in t.fields:
+        add(f.name, ())
+
+    def walk(items, arms):
+        for x in items:
+            if isinstance(x, ir.Field):
+                add(x.name, arms)
+            elif isinstance(x, ir.GenerateFor):
+                walk(x.items, arms)
+            elif isinstance(x, ir.GenerateIf):
+                walk(x.items, arms + ((id(x), 0),))
+                walk(x.orelse, arms + ((id(x), 1),))
+    walk(t.generates, ())
+
+
+def _array_size(f) -> Optional[ir.Expr]:
+    """The element count of an array made by loop ``f``: it must start at 0
+    and run while ``i < N`` (``N``), ``i <= M`` (``M + 1``)."""
+    if not (isinstance(f.start, ir.ExprConstant) and f.start.value == 0):
+        return None
+    c = f.cond
+    if not isinstance(c, ir.ExprCompare) or len(c.ops) != 1:
+        return None
+    op, lhs, rhs = c.ops[0], c.left, c.comparators[0]
+    if rhs is f.leaf:
+        lhs, rhs = rhs, lhs
+        op = {ir.CmpOp.Gt: ir.CmpOp.Lt, ir.CmpOp.GtE: ir.CmpOp.LtE}.get(op)
+    if lhs is not f.leaf or any(x is f.leaf for x in leaves(rhs)):
+        return None
+    if op == ir.CmpOp.Lt:
+        return rhs
+    if op == ir.CmpOp.LtE:
+        return ir.ExprBin(lhs=rhs, op=ir.BinOp.Add, rhs=ir.ExprConstant(value=1))
+    return None
+
+
+def _key(t) -> list:
+    """A structural key of a type: what makes two types equal."""
+    def tpk(tp):
+        if isinstance(tp, ir.TemplateParamType):
+            return ["type", tp.name, _ekey(tp.default_value)]
+        return ["value", tp.name, _ekey(tp.value_type), _ekey(tp.default_value)]
+    out = [_field_key(f) for f in t.fields]
+    out.append([tpk(tp) for tp in getattr(t, "template_params", [])])
+    if isinstance(t, ir.DataTypeComponent):
+        out.append([[_ekey(b.lhs), _ekey(b.rhs)] for b in t.bind_map])
+        out.append([_ekey(g) for g in t.generates])
+    if isinstance(t, ir.DataTypeExtern):
+        out.append([t.extern_name, {k: _ekey(v) for k, v in t.extern_params.items()},
+                    [[p.name, p.path, _ekey(p.tie), p.open, _ekey(p.datatype)]
+                     for p in t.pins]])
+    return out
+
+
+def to_ir(rt, parameterize: bool = True, require_param: bool = False) \
+        -> Tuple[ir.Context, str, List[Diag]]:
+    """The design ``rt`` elaborated, as structural Zuspec IR: the context,
+    the top's type name, and the mapping's diagnostics (§6.6)."""
+    m = IrMapper(rt, parameterize, require_param)
+    ctxt, top = m.run()
+    return ctxt, top, m.diags

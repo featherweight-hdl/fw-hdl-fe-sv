@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+# fw-hdl-fe-sv's own tests. The tasks users run (fw.hdl.fe.sv.Elaborate,
+# EmitSV) are in python/fw/hdl/fe/sv/flow.dv, registered by the Python
+# distribution.
+package:
+  name: fw-hdl-fe-sv
+
+  tasks:
+  # The fw-hdl-spec conformance scenarios, and the end-to-end tests
+  # (examples/wrap_rtl: emit, lint, simulate).
+  - root: tests
+    shell: bash
+    run: |
+      cd $TASK_SRCDIR && python -m pytest -q tests

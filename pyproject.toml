@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fw-hdl-fe-sv"
+version = "0.0.1"
+description = "Featherweight-HDL static front end: SV class descriptions to Zuspec IR"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Matthew Ballance", email = "matt.ballance@gmail.com"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pyslang>=12",
+    "zuspec-fe-sv",
+    "zuspec-ir-core",
+    "zuspec-synth",
+    "zuspec-be-sv",
+]
+
+[project.entry-points."dv_flow.mgr"]
+fw-hdl-fe-sv = "fw.hdl.fe.sv.dfm"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+# fw, fw.hdl and fw.hdl.fe are namespace packages: fw.hdl.fe.sv is a portion.
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["fw.hdl.fe.sv*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"fw.hdl.fe.sv" = ["share/sv/*.sv", "share/sv/*.svh", "flow.dv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
