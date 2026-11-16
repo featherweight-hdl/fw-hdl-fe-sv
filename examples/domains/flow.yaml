@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://dv-flow.github.io/flow.dv.schema.json
+# Clock and reset domains with fw-hdl. See README.md.
+#
+#   dfm run sim      elaborate, emit Verilog, simulate against soc_ref
+#   dfm run emit     just the Verilog (rundir/domains.emit/)
+package:
+  name: domains
+
+  tasks:
+  # The existing RTL: a clock divider and two FIFOs, one of them dual-clock.
+  - name: rtl
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: rtl
+      include: [clk_div2.sv, fw_rv_fifo.sv, async_fifo.sv]
+
+  # The fw-hdl description.
+  - name: design
+    uses: std.FileSet
+    with:
+      type: fwHdlSource
+      base: sv
+      include: [domains_pkg.sv]
+
+  - name: elab
+    uses: fw.hdl.fe.sv.Elaborate
+    needs: [design, rtl]
+    with:
+      top: "domains_pkg::soc#(bit[7:0])"
+
+  - root: emit
+    uses: fw.hdl.fe.sv.EmitSV
+    needs: [elab]
+    with:
+      top_module: soc
+
+  # The hand-wired reference and the side-by-side testbench.
+  - name: tb
+    uses: std.FileSet
+    with:
+      type: systemVerilogSource
+      base: tb
+      include: [soc_ref.sv, soc_tb.sv]
+
+  - name: sim-img
+    uses: hdlsim.vlt.SimImage
+    needs: [emit, tb]
+    with:
+      top: [soc_tb]
+
+  - root: sim
+    uses: hdlsim.vlt.SimRun
+    needs: [sim-img]

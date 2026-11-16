@@ -54,8 +54,12 @@ async def Elaborate(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
     if not files:
         return TaskDataResult(status=1, changed=False, output=[],
                               markers=[_error("no fwHdlSource input")])
-    r = elaborate(files, p.top, incdirs=incdirs, defines=defines, rtl=rtl,
-                  rtl_incdirs=rtl_inc, spec=p.spec or None)
+    try:
+        r = elaborate(files, p.top, incdirs=incdirs, defines=defines, rtl=rtl,
+                      rtl_incdirs=rtl_inc, spec=p.spec or None,
+                      domain_severity=p.domain_severity or None)
+    except ValueError as e:                     # a bad domain_severity
+        return TaskDataResult(status=1, changed=False, output=[], markers=[_error(str(e))])
     markers = _diag_markers(r.diags)
     if not r.ok:
         return TaskDataResult(status=1, changed=True, output=[], markers=markers)

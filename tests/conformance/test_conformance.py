@@ -2,7 +2,9 @@
 
 fe-sv runs every scenario, including the ``static-only`` ones (header checks
 and static analysis), and must produce each expected netlist or set of
-diagnostics exactly (semantics/netlist.md, "Conformance comparison")."""
+diagnostics exactly (semantics/netlist.md, "Conformance comparison").
+Scenarios that need a feature fe-sv does not implement yet (``features`` in
+``meta.json``, not in ``FEATURES``) are skipped."""
 import difflib
 import json
 import os
@@ -13,6 +15,14 @@ import pytest
 from fw.hdl.fe.sv import elaborate
 from fw.hdl.fe.sv.api import spec_dir
 from fw.hdl.fe.sv.netlist import canonical
+
+# The optional features of the spec that fe-sv implements (meta.json
+# "features").
+FEATURES = {"domains"}
+
+# Scenarios that need a part of a feature still to come
+# (core-domains-plan.md §9). None now; kept for the steps ahead.
+PENDING: dict = {}
 
 
 def _scenarios():
@@ -26,6 +36,11 @@ def _scenarios():
 @pytest.mark.parametrize("d", _scenarios(), ids=lambda d: d.name)
 def test_scenario(d: Path):
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").is_file() else {}
+    missing = sorted(set(meta.get("features", [])) - FEATURES)
+    if missing:
+        pytest.skip("needs " + ", ".join(missing))
+    if d.name in PENDING:
+        pytest.skip("needs " + PENDING[d.name])
     expect = json.loads((d / "expect.json").read_text())
     r = elaborate([str(d / "top.sv")], top="scenario::top", incdirs=[str(d)],
                   rtl=[str(d / f) for f in meta.get("rtl", [])])

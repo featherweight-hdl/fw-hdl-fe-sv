@@ -108,7 +108,13 @@ TOP_MODULE = "__fw_fe_sv_top"
 def elaborate(files: Sequence[str], top: str, *,
               incdirs: Sequence[str] = (), defines: Optional[Dict[str, str]] = None,
               rtl: Sequence[str] = (), rtl_incdirs: Sequence[str] = (),
-              spec: Optional[str] = None, top_name: str = "top") -> ElabResult:
+              spec: Optional[str] = None, top_name: str = "top",
+              domain_severity=None) -> ElabResult:
+    """Elaborate ``top``. ``domain_severity`` overrides kinds' crossing
+    severities: ``{"fw_reset_kind": {"unrelated": "warning"}}``, or the text
+    ``fw_reset_kind.unrelated=warning,...``; ``"none"`` silences."""
+    from zuspec.synth.passes.domains import severity_option
+    sev = severity_option(domain_severity)        # ValueError on a bad option
     api = Api(spec)
     text = f"module {TOP_MODULE}; typedef {top} __fw_top_t; endmodule\n"
     cres = sv_compile(api.files + list(files), incdirs=api.incdirs + list(incdirs),
@@ -124,6 +130,7 @@ def elaborate(files: Sequence[str], top: str, *,
     rt.compile_result = cres          # keeps the source manager and trees alive
     rt.headers = Headers(rtl, rtl_incdirs, defines)
     rt.interp = Interpreter(comp, FeIntrinsics(rt))
+    rt.dom.severity_opt = sev
     try:
         rt.elaborate(cls, top_name)
     except (ElabError, InterpError) as e:

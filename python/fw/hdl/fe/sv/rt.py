@@ -25,7 +25,7 @@ from zuspec.fe.sv.interp.values import Struct, Sym, const_to_py, norm, strip, un
 from . import types as ty
 from . import values as vx
 from .params import ParamArg
-from .objects import (BUNDLE, COMPONENT, MIRROR, MONITOR, Conn, Diag, ExternRec,
+from .objects import (BUNDLE, COMPONENT, MIRROR, MONITOR, Assoc, Conn, Diag, ExternRec,
                       FwBundle, FwComponent, FwObject, FwSignal, PinRule, Tie)
 
 _SIGNAL_DIR = {"fw_signal": None, "fw_input": "in", "fw_output": "out", "fw_inout": "inout"}
@@ -94,6 +94,8 @@ class FeRt:
         # (ir_map.cond_key); on while the top's own code runs.
         self.force: Dict[str, bool] = {}
         self._force_on = False
+        from .domains import Domains
+        self.dom = Domains(self)
 
     # -- diagnostics ----------------------------------------------------
     def error(self, id: str, path: str, msg: str) -> None:
@@ -108,6 +110,7 @@ class FeRt:
 
     # -- object map -----------------------------------------------------
     def fw(self, sv) -> Optional[FwObject]:
+        sv = unwrap(sv)
         if sv is None:
             return None
         return self._by_sv.get(id(sv))
@@ -166,9 +169,10 @@ class FeRt:
 
     # -- elaboration ----------------------------------------------------
     def elaborate(self, top_cls, name: str = "top", params=None,
-                  path_alias: Optional[str] = None) -> Optional[FwComponent]:
+                  path_alias: Optional[str] = None, seed=None) -> Optional[FwComponent]:
         """Create ``top_cls`` as the top and run every phase. ``params``, if
-        given, is the top's params value (else ``mk_params()``)."""
+        given, is the top's params value (else ``mk_params()``); ``seed(top)``
+        runs after the top is created, before its build."""
         create = self.interp.find_method(top_cls, "create")
         if create is None:
             raise ElabError(f"{ty.type_name(top_cls)} has no create(): "
@@ -178,6 +182,8 @@ class FeRt:
         args = [name, None] if params is None else [name, None, params]
         top_sv = self.interp.call(create, None, args)
         self.top = self.fw(top_sv)
+        if seed is not None and self.top is not None:
+            seed(self.top)
         self.phase = "build"
         self._walk(self.top, "build")
         for o in self.overrides:
@@ -572,9 +578,28 @@ class FeRt:
         from zuspec.fe.sv.interp import Interpreter
         alt.interp = Interpreter(self.comp, FeIntrinsics(alt))
         alt.force = dict(force)
+        alt.dom.kinds.update(self.dom.kinds)
+
+        def seed(top):
+            # The domains c sees: its named associations and each kind's
+            # default, as the same domain objects, so that its code reads
+            # what it read in the design. They count as read: an arm that
+            # does not read one is not FW-E-DOM-UNUSED.
+            from . import domains as dm
+            for (kn, n), a in c.assoc.items():
+                if n:
+                    top.assoc[(kn, n)] = a
+                    top.aread.add((kn, n))
+            for kn in self.dom.kinds:
+                d = dm.get(c, kn)
+                if d is not None:
+                    top.assoc[(kn, "")] = c.assoc.get((kn, "")) or Assoc(
+                        c.parent or c, top, kn, "", d)
+            for d in {id(a.dom): a.dom for a in top.assoc.values()}.values():
+                alt._by_sv.setdefault(id(d.sv), d)
         try:
             alt.elaborate(c.cls, c.name, params=vx.copy(c.params) if c.params is not None
-                          else None, path_alias=c.path)
+                          else None, path_alias=c.path, seed=seed)
         except (ElabError, InterpError) as e:
             alt.error("FW-E-ELAB", c.path, str(e))
         return alt.top, alt.errors
@@ -772,9 +797,45 @@ class FeIntrinsics(Intrinsics):
             return sv
         elif api == "fw_pin_rule" and name == "rename":
             return rt.rule_rename(this, vx.to_str(a[0]), vx.to_str(a[1]))
+        elif api == "fw_domain":
+            r = self._domain(owner, sub, this, name, a)
+            if r is not NOT_HANDLED:
+                return r
+        elif api == "fw_domain_base" and name == "kind":
+            return rt.dom.kind_of(this)
+        elif api == "fw_domain_kind_type_of":
+            if name == "get":
+                return rt.dom.handle(owner)
+            if name == "name":
+                return rt.dom.handle_name(this)
         if (api, name) in rt.extern_methods:
             raise ElabError(f"fe-sv does not implement {api}::{name}")
         return NOT_HANDLED        # written in SV in the API itself (fw_rv_if::build)
+
+    def _domain(self, owner, sub, this, name, a):
+        """``fw_domain #(K)``'s functions (domains.py)."""
+        d = self.rt.dom
+        if name == "create":
+            return d.create(owner, sub, a[0], a[1], a[2])
+        if name == "set":
+            return d.set(owner, a[0], a[1], a[2])
+        if name == "get":
+            return d.get(owner, a[0], a[1])
+        if name == "relate":
+            return d.relate(a[0], a[1])
+        if name in ("pin", "pin_out"):
+            return d.pin(owner, sub, a[0], a[1], a[2], a[3], name == "pin_out")
+        if name == "waive":
+            return d.waive(owner, a[0], a[1], a[2])
+        if name == "port_name":
+            return d.port_name(owner, a[0], a[1], a[2])
+        if name == "provides":
+            return d.provides(owner, sub, a[0], a[1], a[2])
+        if name == "drive":
+            return d.drive(owner, sub, this, a[0], a[1])
+        if name == "params":
+            return d.params(this)
+        return NOT_HANDLED
 
     def call(self, interp, sub, this, args, named=None):
         try:

@@ -16,6 +16,7 @@ SIGNAL = "signal"
 BUNDLE = "bundle"
 MIRROR = "mirror"
 MONITOR = "monitor"
+DOMAIN = "domain"
 BUNDLE_KINDS = (BUNDLE, MIRROR, MONITOR)
 
 
@@ -47,6 +48,11 @@ class FwObject:
     # The path of a top elaborated on its own to explore another arm of a
     # branch (FeRt.explore): the path of the component it stands for.
     path_alias: Optional[str] = None
+    # Domains (domains.py): the associations set on this object, by
+    # (kind name, association name), each an ``Assoc``; and the named
+    # associations read with get().
+    assoc: Dict[tuple, "Assoc"] = dc.field(default_factory=dict)
+    aread: set = dc.field(default_factory=set)
 
     @property
     def path(self) -> str:
@@ -119,6 +125,14 @@ class FwComponent(FwObject):
     frames: List[Any] = dc.field(default_factory=list)      # CtlFrames run in its code
     conns: List["Conn"] = dc.field(default_factory=list)    # connections made in its code
     ties: List["Tie"] = dc.field(default_factory=list)
+    # Domains: what the component's code said about its own class, by
+    # (kind name, association name): port_name() and provides().
+    dassocs: List["Assoc"] = dc.field(default_factory=list)      # set() in its build()
+    pnames: Dict[tuple, str] = dc.field(default_factory=dict)
+    provs: Dict[tuple, Any] = dc.field(default_factory=dict)       # (params value, its type,
+                                                                   # its sources' refs)
+    waivers: List["Waiver"] = dc.field(default_factory=list)       # made in its connect()
+    drivers: List["Driver"] = dc.field(default_factory=list)       # drive() in its connect()
 
     @property
     def leaves(self) -> Dict[int, str]:
@@ -175,6 +189,86 @@ class FwBundle(FwObject):
         return out
 
 
+@dc.dataclass(eq=False)
+class FwDomain(FwObject):
+    """A domain object (domains.md, "Domain objects"). ``kclass`` is the
+    kind class K, ``kname`` its name; ``params`` the params value given to
+    ``create``; ``sources`` the domains in its ``from``, and ``clock`` a
+    reset's clock domain. A domain whose creation failed is ``detached``:
+    it is in no tree, and calls on it do nothing."""
+    kind: str = DOMAIN
+    kclass: Any = None
+    kname: str = ""
+    params: Any = None
+    params_type: Any = None
+    sources: List["FwDomain"] = dc.field(default_factory=list)
+    # How the creator's code reached each source (``DomainRef``, or None):
+    # see ``Domains.ref_of``.
+    source_refs: List[Any] = dc.field(default_factory=list)
+    clock: Optional["FwDomain"] = None
+    drivers: List["Driver"] = dc.field(default_factory=list)
+    realized: bool = False
+    detached: bool = False
+
+
+@dc.dataclass
+class Assoc:
+    """``fw_domain #(K)::set(obj, dom, name)``, made in ``scope``'s build."""
+    scope: "FwComponent"
+    obj: FwObject
+    kname: str
+    name: str
+    dom: FwDomain
+    ctx: tuple = ()
+    ref: Any = None           # how the code reached ``dom`` (a DomainRef), if known
+
+
+@dc.dataclass
+class Driver:
+    """A domain's driver: ``drive(sig, attr)`` (``sig`` set) in ``scope``'s
+    connect, or an extern's ``pin_out`` (``extern`` and ``pin`` set).
+    ``attr`` is the attribute value, ``attr_type`` its slang type."""
+    dom: FwDomain
+    attr: Any
+    attr_type: Any
+    scope: Optional["FwComponent"] = None
+    sig: Optional["FwSignal"] = None
+    extern: Optional["FwComponent"] = None
+    pin: str = ""
+    ctx: tuple = ()
+
+    @property
+    def key(self) -> str:
+        return self.sig.path if self.sig is not None else f"{self.extern.path} {self.pin}"
+
+
+@dc.dataclass
+class DomPin:
+    """A domain pin of an extern map: ``pin`` (``out`` False) or
+    ``pin_out``. ``dom`` is the domain, None when it resolves to none;
+    ``explicit`` when the map named the domain (not ``get(extern)``)."""
+    pin: str
+    kname: str
+    dom: Optional[FwDomain]
+    out: bool
+    attr: Any
+    attr_type: Any
+    explicit: bool = True
+    ref: Any = None           # how the map reached ``dom`` (a DomainRef), if known
+
+
+@dc.dataclass
+class Waiver:
+    """``fw_domain #(K)::waive(a, b, reason)`` in ``scope``'s connect."""
+    scope: "FwComponent"
+    kname: str
+    a: FwObject
+    b: FwObject
+    reason: str
+    seq: int = 0
+    matched: bool = False
+
+
 @dc.dataclass
 class PinRule:
     """``m.prefix(b, pre)`` with its renames."""
@@ -193,13 +287,14 @@ class ExternRec:
     rules: List[PinRule] = dc.field(default_factory=list)
     ties: Dict[str, int] = dc.field(default_factory=dict)
     opens: List[str] = dc.field(default_factory=list)
+    dpins: List[DomPin] = dc.field(default_factory=list)     # domain pins, in call order
     unused: List["FwObject"] = dc.field(default_factory=list)  # unused(): ports or bundles
     # Tracing: param() and tie() values as given (Syms where traced), and
     # the traced frames active when extern_map() made them.
     tie_syms: Dict[str, Any] = dc.field(default_factory=dict)
     ctl: bool = False
-    # Resolved by the check: pin -> ("port", FwSignal) | ("tie", int) | ("open", None),
-    # in module order.
+    # Resolved by the check: pin -> ("port", FwSignal) | ("tie", int) | ("open", None)
+    # | ("domain", DomPin), in module order.
     resolved: List[tuple] = dc.field(default_factory=list)
     unused_ports: List["FwSignal"] = dc.field(default_factory=list)   # leaf ports, by path
     header: Any = None

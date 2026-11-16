@@ -200,6 +200,10 @@ def resolve(rt) -> None:
     for c in rt.components:
         if c.is_extern and c.extern is not None:
             check_extern(rt, c)
+    from .domains import check as domain_check, passes as domain_passes
+    domain_check(rt)
+    if not rt.force:          # not an explore() run: its domains are borrowed
+        domain_passes(rt)
 
 
 # -- externs -----------------------------------------------------------------
@@ -223,7 +227,8 @@ def extern_ports(c: FwComponent) -> List[Tuple[List[str], FwSignal]]:
 
 
 def pin_map(rt, c: FwComponent):
-    """Pin name → ("port", sig) | ("tie", v) | ("open", None), from the map
+    """Pin name → ("port", sig) | ("tie", v) | ("open", None) | ("domain",
+    DomPin), from the map
     and the default rule, before checking against a header. Reports a pin
     mapped twice."""
     rec = c.extern
@@ -264,6 +269,8 @@ def pin_map(rt, c: FwComponent):
             continue
         put(pin, ("port", s))
         mapped.add(id(s))
+    for dp in rec.dpins:
+        put(dp.pin, ("domain", dp))
     for r in rec.rules:
         for path, s in extern_ports_of(r.bundle):
             if id(s) in mapped:
@@ -347,5 +354,13 @@ def check_extern(rt, c: FwComponent) -> None:
             rt.error("FW-E-EXT-DIR", c.path, f"tie on {rec.module} pin {hp.name!r}, an {hp.direction}")
         elif what == "open" and hp.direction == "in":
             rt.error("FW-E-EXT-DIR", c.path, f"open on {rec.module} input pin {hp.name!r}")
+        elif what == "domain":
+            want = "out" if v.out else "in"
+            if hp.direction != want:
+                rt.error("FW-E-DOM-PIN", c.path, f"domain pin {hp.name!r} of {rec.module} is "
+                         f"an {hp.direction}, mapped as an {want}")
+            if hp.width != 1:
+                rt.error("FW-E-DOM-PIN", c.path, f"domain pin {hp.name!r} of {rec.module} is "
+                         f"{hp.width} bits")
         resolved.append((hp.name, what, v, hp.width))
     rec.resolved = resolved

@@ -34,6 +34,14 @@ package:
         doc: Make a class that must be emitted per specialization an error, not a note
         type: bool
         value: false
+      domain_severity:
+        doc: |
+          Crossing severities by kind and relation, overriding the kinds' own:
+          ``{fw_reset_kind: {unrelated: warning}}``. A relation is ``same``,
+          ``related`` or ``unrelated``; a severity ``none``, ``info``,
+          ``warning`` or ``error`` (``none`` silences).
+        type: map
+        value: {}
     shell: pytask
     run: fw.hdl.fe.sv.dfm.Elaborate
 

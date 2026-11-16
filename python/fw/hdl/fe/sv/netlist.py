@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from zuspec.fe.sv.interp.values import Obj, Struct, const_to_py
 
 from . import types as ty
-from .objects import FwBundle, FwComponent, FwObject, FwSignal
+from .objects import FwBundle, FwComponent, FwDomain, FwObject, FwSignal
 from .resolve import endpoint_kind
 
 
@@ -79,20 +79,25 @@ def _value_text(v, t) -> str:
     return str(v)
 
 
-def params_value(v, t) -> Any:
-    """A params field's value (netlist.schema.json ``params``)."""
+def params_value(v, t, handle=None) -> Any:
+    """A params field's value (netlist.schema.json ``params``). ``handle``,
+    if given, writes a class handle it knows (a domain, as its path), or
+    returns None to leave it to the default."""
     c = ty.canon(t)
     if isinstance(v, Obj) or v is None and c is not None and getattr(c, "isClass", False):
         if v is None:
             return None
+        h = handle(v) if handle is not None else None
+        if h is not None:
+            return h
         d = ty.type_param(v.cls, "D")
         return spell(d) if d is not None else spell(v.cls)
     if isinstance(v, Struct):
         fts = {f.name: f.type for f in c}
-        return {k: params_value(x, fts.get(k)) for k, x in v.items()}
+        return {k: params_value(x, fts.get(k), handle) for k, x in v.items()}
     if isinstance(v, list):
         et = getattr(c, "arrayElementType", None)
-        return [params_value(x, et) for x in v]
+        return [params_value(x, et, handle) for x in v]
     if isinstance(v, str):
         return v
     if isinstance(v, int) and c is not None and getattr(c, "isIntegral", False):
@@ -103,7 +108,57 @@ def params_value(v, t) -> Any:
     return v
 
 
-def _object(o: FwObject) -> Dict[str, Any]:
+def _by_kind(m: Dict[tuple, Any], f) -> Dict[str, Dict[str, Any]]:
+    """A map keyed by (kind name, association name) as kind -> name -> f(v)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for (k, n), v in m.items():
+        out.setdefault(k, {})[n] = f(v)
+    return out
+
+
+def _domain_members(rt, o: FwObject, d: Dict[str, Any]) -> Dict[str, Any]:
+    """The domain members of ``o``'s record (domains.md, Netlist), each
+    present only when non-empty."""
+    from .domains import value_json
+    if o.assoc:
+        d["assoc"] = _by_kind(o.assoc, lambda a: a.dom.path)
+    if not isinstance(o, FwComponent):
+        return d
+    if o.waivers:
+        ws = sorted(o.waivers, key=lambda w: (w.a.path, w.b.path, w.kname, w.seq))
+        d["waivers"] = [{"kind": w.kname, "a": w.a.path, "b": w.b.path, "reason": w.reason}
+                        for w in ws]
+    if o.pnames:
+        d["port_names"] = _by_kind(o.pnames, lambda n: n)
+    if o.provs:
+        d["provides"] = _by_kind(o.provs, lambda pt: value_json(rt, pt[0], pt[1]))
+    if o.is_extern and o.extern is not None and o.extern.dpins:
+        pins: Dict[str, Any] = {}
+        for p in o.extern.dpins:
+            pins.setdefault(p.pin, {"kind": p.kname,
+                                    "domain": p.dom.path if p.dom is not None else None,
+                                    "dir": "out" if p.out else "in",
+                                    "attr": value_json(rt, p.attr, p.attr_type)})
+        d.setdefault("extern", {})["domain_pins"] = pins
+    return d
+
+
+def _object(rt, o: FwObject) -> Dict[str, Any]:
+    return _domain_members(rt, o, _object_l1(rt, o))
+
+
+def _object_l1(rt, o: FwObject) -> Dict[str, Any]:
+    if isinstance(o, FwDomain):
+        from .domains import value_json
+        drvs = sorted(o.drivers, key=lambda x: x.key)
+        out = []
+        for x in drvs:
+            e = {"signal": x.sig.path} if x.sig is not None else \
+                {"extern": x.extern.path, "pin": x.pin}
+            e["attr"] = value_json(rt, x.attr, x.attr_type)
+            out.append(e)
+        return {"path": o.path, "kind": "domain", "type": spell(o.cls),
+                "params": value_json(rt, o.params, o.params_type), "drivers": out}
     if isinstance(o, FwComponent):
         d: Dict[str, Any] = {"path": o.path, "kind": "component", "type": spell(o.cls)}
         if o.params_type is not None:
@@ -164,7 +219,7 @@ def netlist(rt) -> Dict[str, Any]:
     diags = sorted({(d.id, d.path) for d in rt.diags}, key=lambda x: (x[1], x[0]))
     return {
         "top": spell(rt.top.cls) if rt.top is not None else "",
-        "objects": sorted((_object(o) for o in objs), key=lambda d: d["path"]),
+        "objects": sorted((_object(rt, o) for o in objs), key=lambda d: d["path"]),
         "nets": nets,
         "diagnostics": [{"id": i, "path": p} for i, p in diags],
     }

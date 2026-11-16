@@ -2,7 +2,7 @@
 // same random stimulus and requires every output to match on every cycle.
 // Also checks the stream itself: values leave in the order they entered.
 module chain_tb;
-    logic       clk = 0, rst = 1, rst_n = 0;
+    logic       clk = 0, rst = 1;
     logic       in_valid = 0, out_ready = 0;
     logic [7:0] in_data = 0;
 
@@ -10,12 +10,12 @@ module chain_tb;
     logic [7:0] g_out_data, r_out_data;
 
     chain dut (
-        .clk(clk), .rst(rst), .rst_n(rst_n),
+        .clk_i(clk), .rst_i(rst),
         .in_valid(in_valid), .in_ready(g_in_ready), .in_data(in_data),
         .out_valid(g_out_valid), .out_ready(out_ready), .out_data(g_out_data));
 
     chain_ref ref_ (
-        .clk(clk), .rst(rst), .rst_n(rst_n),
+        .clk_i(clk), .rst_i(rst),
         .in_valid(in_valid), .in_ready(r_in_ready), .in_data(in_data),
         .out_valid(r_out_valid), .out_ready(out_ready), .out_data(r_out_data));
 
@@ -33,7 +33,7 @@ module chain_tb;
 
     initial begin
         repeat (3) @(posedge clk);
-        rst <= 0; rst_n <= 1;
+        rst <= 0;
         repeat (2000) begin
             @(posedge clk);
             // Compare the generated design with the reference.

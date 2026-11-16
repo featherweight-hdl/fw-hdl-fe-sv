@@ -1,6 +1,7 @@
-"""End to end on examples/wrap_rtl (core-layer1.md M5): elaborate the fw-hdl
-assembly of two wrapped RTL modules, emit Verilog, lint it, and simulate it
-against the hand-wired reference."""
+"""End to end on examples/wrap_rtl (core-layer1.md M5; core-domains-plan D6):
+elaborate the fw-hdl assembly of two wrapped RTL modules, whose clock and
+reset are domains, emit Verilog, lint it, and simulate it against the
+hand-wired reference."""
 import shutil
 import subprocess
 from pathlib import Path
@@ -36,7 +37,12 @@ def test_elaborate_and_map_pins():
     assert pins["out_rdy"] == ("port", "top.fifo.out.ready")
     assert pins["in_data"] == ("port", "top.fifo.in.data")
     spins = {p: (w, getattr(v, "path", v)) for p, w, v, _ in slice_.extern.resolved}
-    assert spins["aresetn"] == ("port", "top.slice.rst_n")
+    # Clock and reset pins are domain pins: no ports, no connections.
+    assert "clk" not in fifo.children and "rst_n" not in slice_.children
+    assert {dp.pin: dp.dom.path for dp in fifo.extern.dpins} == \
+        {"clk": "top.clk", "rst": "top.rst"}
+    assert {dp.pin: dp.dom.path for dp in slice_.extern.dpins} == \
+        {"aclk": "top.clk", "aresetn": "top.rst"}
     assert spins["s_axis_tvalid"] == ("port", "top.slice.s.valid")
     assert spins["s_axis_tlast"] == ("tie", 1)
     assert spins["m_axis_tlast"] == ("open", None)
@@ -53,6 +59,10 @@ def test_emit_lint_and_simulate(tmp_path):
     text = (tmp_path / "gen" / "chain.sv").read_text()
     assert "  logic slice_m_axis_tlast_unused;\n" in text
     assert "    .m_axis_tlast(slice_m_axis_tlast_unused)\n" in text and "lint_" not in text
+    # The domains: nets driven from the inputs; aresetn reads the inverted reset.
+    assert "  assign clk = clk_i;\n  assign rst = rst_i;\n  assign rst_inv = ~rst;\n" in text
+    assert ".clk(clk)" in text and ".rst(rst)" in text
+    assert ".aclk(clk)" in text and ".aresetn(rst_inv)" in text
 
     lint = subprocess.run(["verilator", "--lint-only", "-Wall", "--top-module", "chain"] + files,
                           capture_output=True, text=True, cwd=tmp_path)

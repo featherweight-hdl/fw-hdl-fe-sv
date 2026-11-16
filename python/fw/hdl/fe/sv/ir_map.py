@@ -38,6 +38,19 @@ it can be, i.e. one IR type per class, whatever its parameter values:
   ``extern_params`` are expressions over them, and its instance's
   ``inst_params`` say what they are.
 
+Domains (core-domains-plan §6.2, the Z6 shapes): each kind used is a
+``DataTypeDomainKind`` in ``type_m``; a component's domain objects,
+associations, drivers and waivers are its ``domains``,
+``domain_assocs``, ``domain_drivers`` and ``domain_waivers``; an extern's
+domain pins are ``ExternPin``\\ s with ``domain_kind``. A domain the
+component's code reached is written as it can be reached from the
+component: its own domain object by name, else the resolution of one of
+its associations (its own, an interface's or a child's) that gives it;
+the ref the code read it through (``get``), when fe-sv recorded one. An
+association of a child created under a branch on parameters goes in the
+child's generate if; any other domain statement under a loop or branch on
+parameters makes the component a specialization (§6.1).
+
 A component whose structure cannot be written that way (the
 *specialization rule*: an override from a farther ancestor, a
 constructor factory that picks another realization, control flow the
@@ -59,11 +72,12 @@ import zuspec.ir.core as ir
 
 from .params import to_ir as param_ir
 from zuspec.fe.sv.interp.trace import leaves
-from zuspec.fe.sv.interp.values import Sym
+from zuspec.fe.sv.interp.values import Sym, strip
 
 from . import types as ty
-from .objects import (BUNDLE, MIRROR, MONITOR, Diag, FwBundle, FwComponent, FwObject,
-                      FwSignal)
+from .objects import (BUNDLE, MIRROR, MONITOR, Diag, FwBundle, FwComponent, FwDomain,
+                      FwObject, FwSignal)
+from . import domains as dm
 
 _ROLE = {BUNDLE: ir.BundleRole.INITIATOR, MIRROR: ir.BundleRole.MIRROR,
          MONITOR: ir.BundleRole.MONITOR}
@@ -197,6 +211,8 @@ def _ekey(e) -> Any:
                 [_ekey(x) for x in e.orelse]]
     if isinstance(e, ir.Field):
         return _field_key(e)
+    if isinstance(e, ir.DomainAssoc):
+        return ["dassoc", _pkey(e.target), e.kind, e.assoc, _dkey(e.domain)]
     raise TypeError(f"no key for {type(e).__name__}")
 
 
@@ -375,7 +391,8 @@ def _loops(ctx) -> tuple:
 class _Block:
     """A region: ``items`` by key, in order: ``("f", name)`` a Field,
     ``("e", base)`` an array element (an _Elem), ``("b", key)`` a Bind,
-    ``("loop", frame key)`` a _Loop, ``("if", frame key)`` an _If."""
+    ``("d", key)`` a DomainAssoc, ``("loop", frame key)`` a _Loop,
+    ``("if", frame key)`` an _If."""
 
     def __init__(self):
         self.items: Dict[tuple, Any] = {}
@@ -475,7 +492,9 @@ class IrMapper:
         self._anon = 0
 
     def run(self) -> Tuple[ir.Context, str]:
-        return self.ctxt, self._component(self.rt.top)
+        top = self._component(self.rt.top)
+        self._port_names()
+        return self.ctxt, top
 
     # -- types --------------------------------------------------------------
     def _type(self, t) -> ir.DataType:
@@ -776,6 +795,11 @@ class IrMapper:
         for tie in c.ties:
             t.bind_map.append(ir.Bind(lhs=self._path(tie.sig, c),
                                       rhs=ir.ExprConstant(value=tie.value, width=tie.sig.width)))
+        try:
+            self._domains(c, t)
+        except NotParam as e:
+            from .rt import ElabError
+            raise ElabError(str(e))
         return t
 
     def _arrays_of(self, o) -> set:
@@ -821,6 +845,7 @@ class IrMapper:
         t.bind_map = [x for x in root if isinstance(x, ir.Bind)]
         t.generates = [x for x in root if isinstance(x, (ir.GenerateFor, ir.GenerateIf))]
         _check_names(t)
+        self._domains(c, t, general=True)
         return t
 
     def _explore(self, c: FwComponent) -> _Block:
@@ -874,11 +899,20 @@ class IrMapper:
                 raise NotParam(f"{f.reason} ({f.where})")
             if f.irregular and f.unexplored:
                 raise NotParam(f"a loop or branch on parameters is left early ({f.where})")
+        for what, ctx in _domain_stmts(c, assocs=False):
+            if ctx:
+                raise NotParam(f"{what} is under a loop or branch on parameters")
         self._pre_arrays(sc)
         root = _Block()
-        # Objects, in creation order.
+        # Objects, in creation order. Domain objects are not fields.
         for ch in c.children.values():
-            self._place_object(sc, root, ch)
+            if not isinstance(ch, FwDomain):
+                self._place_object(sc, root, ch)
+        # Associations of children created under a branch on parameters: in
+        # the child's arm.
+        for a in c.dassocs:
+            if a.ctx:
+                self._place_assoc(sc, root, a)
         # Connections and ties.
         for conn in c.conns:
             b = ir.Bind(lhs=self._sym_path(sc, conn.a, conn.a_sym, conn.ctx),
@@ -919,7 +953,7 @@ class IrMapper:
         ``base[<loop variable>]``."""
         c = sc.c
         for ch in c.children.values():
-            if not ch.ctx or ch.ctx[-1][0].kind != "loop":
+            if isinstance(ch, FwDomain) or not ch.ctx or ch.ctx[-1][0].kind != "loop":
                 continue
             f, _k, v, _t = ch.ctx[-1]
             if ch.name_sym is None:
@@ -1035,6 +1069,25 @@ class IrMapper:
         blk = self._block(sc, root, ch.ctx)
         blk.items[("f", ch.name)] = self._field_of(sc, ch, ())
 
+    def _place_assoc(self, sc: _Scope, root: _Block, a) -> None:
+        """An association made under a branch on parameters (no loop): of a
+        child created in the same arm, it goes in that arm's generate if,
+        with the child. Any other is a specialization."""
+        c = sc.c
+        what = f"the association of {a.obj.path} with {a.dom.path}"
+        if _loops(a.ctx) or any(f.kind != "if" for f, *_ in a.ctx):
+            raise NotParam(f"{what} is under a loop on parameters")
+        o = a.obj
+        if not (isinstance(o, FwComponent) and o.parent is c and o.ctx
+                and [(id(f), t) for f, _k, _v, t in o.ctx] ==
+                [(id(f), t) for f, _k, _v, t in a.ctx]):
+            raise NotParam(f"{what} is under a branch on parameters but is not of a child "
+                           f"created in the same arm")
+        da = ir.DomainAssoc(target=[o.name], kind=self._domain_kind(a.kname), assoc=a.name,
+                            domain=self._dref(c, a.dom, a.ref))
+        blk = self._block(sc, root, a.ctx)
+        blk.items[("d", json.dumps(_ekey(da), sort_keys=True))] = da
+
     def _field_of(self, sc: _Scope, ch: FwObject, genvars, name: Optional[str] = None,
                   array: Optional[ir.DataTypeArray] = None) -> ir.Field:
         c = sc.c
@@ -1060,7 +1113,7 @@ class IrMapper:
         for key, x in blk.items.items():
             if key[0] == "f":
                 fields.append(x)
-            elif key[0] == "b":
+            elif key[0] in ("b", "d"):
                 rest.append(x)
             elif key[0] == "e":
                 raise NotParam(f"{key[1]}[] is made outside a loop")
@@ -1243,15 +1296,156 @@ class IrMapper:
                 else:
                     e = ir.ExprConstant(value=v, width=w or 0)
                 pins.append(ir.ExternPin(name=p, tie=e))
+            elif what == "domain":
+                pins.append(ir.ExternPin(
+                    name=p, domain_kind=self._domain_kind(v.kname), output=v.out,
+                    domain=self._dref(c, v.dom, v.ref) if v.explicit else None,
+                    domain_attr=_value_exprs(self.rt, v.attr, v.attr_type)))
             else:
                 hp = hdr.port(p) if hdr is not None else None
                 pins.append(ir.ExternPin(name=p, open=True, datatype=_open_pin_type(
                     hp, hdr, params, general, f"open pin {p} of {c.path}")))
         t = ir.DataTypeExtern(name=c.type_name, super=None, fields=fields,
                               extern_name=rec.module, extern_params=params, pins=pins)
+        # What its build() said about domains: its interfaces' associations
+        # (a dual-clock FIFO's in and out), provides, port names.
+        if general:
+            self._domains(c, t)
+        else:
+            try:
+                self._domains(c, t)
+            except NotParam as e:
+                from .rt import ElabError
+                raise ElabError(str(e))
         if general:
             t.template_params = self._template_params(c)
         return t
+
+    # -- domains (Z6) -------------------------------------------------------
+    def _domain_kind(self, kname: str) -> str:
+        """The kind's ``DataTypeDomainKind`` in ``type_m``, made once."""
+        if kname not in self.ctxt.type_m:
+            d = self.rt.dom
+            kclass = d.kinds[kname]
+            derivs: Dict[str, ir.DomainDerivDecl] = {}
+            ptype = _member_type(kclass, "params_t")
+            dt = _field_type(ptype, "deriv")
+            for m in (dt or []):
+                if type(m).__name__ == "EnumValueSymbol":
+                    n = m.name.lower()
+                    derivs[n] = ir.DomainDerivDecl(sources=[] if n == "root" else ["from"])
+            sev = {r.name.lower(): ir.DomainSeverity[d.severity(kname, r).upper()]
+                   for r in ir.DomainRel}
+            self.ctxt.type_m[kname] = ir.DataTypeDomainKind(
+                name=kname, physical=d.physical(kname), derivations=derivs, severities=sev)
+        return kname
+
+    def _dref(self, c: FwComponent, dom: Optional[FwDomain],
+              ref: Optional[ir.DomainRef] = None) -> Optional[ir.DomainRef]:
+        """``dom`` as ``c``'s code reaches it (see the module docstring):
+        ``ref``, the ref the code read it through, when it gives ``dom``."""
+        if dom is None:
+            return None
+        k = self._domain_kind(dom.kname)
+        if ref is not None and self._ref_gives(c, ref, dom):
+            return ir.DomainRef(kind=ref.kind, assoc=ref.assoc, target=list(ref.target))
+        if dom.parent is c:
+            return ir.DomainRef(decl=dom.name)
+        if dm.get(c, k) is dom:
+            return ir.DomainRef(kind=k)
+        for (kn, n), a in c.assoc.items():
+            if kn == k and n and a.dom is dom:
+                return ir.DomainRef(kind=k, assoc=n)
+        for ch in c.children.values():
+            if isinstance(ch, FwComponent):
+                for (kn, n), a in ch.assoc.items():
+                    if kn == k and n and a.dom is dom:
+                        return ir.DomainRef(kind=k, assoc=n, target=[ch.name])
+            if isinstance(ch, (FwComponent, FwBundle, FwSignal)) and dm.get(ch, k) is dom:
+                return ir.DomainRef(kind=k, target=[ch.name])
+        raise NotParam(f"{c.path} uses domain {dom.path}, which it cannot reach by name or "
+                       f"through an association")
+
+    @staticmethod
+    def _ref_gives(c: FwComponent, ref: ir.DomainRef, dom: FwDomain) -> bool:
+        o = c
+        for n in ref.target:
+            o = o.children.get(n) if o is not None else None
+        return o is not None and dm.get(o, ref.kind, ref.assoc) is dom
+
+    def _domains(self, c: FwComponent, t: ir.DataTypeComponent, general: bool = False) -> None:
+        """The Z6 shapes of what ``c``'s code said about domains. In a
+        general type, an association made under a branch on parameters is
+        in its generate if instead (``_place_assoc``)."""
+        rt = self.rt
+        for ch in c.children.values():
+            if not isinstance(ch, FwDomain):
+                continue
+            k = self._domain_kind(ch.kname)
+            deriv, params = _decl_params(rt, ch, lambda o: self._dref(c, o))
+            refs = list(ch.source_refs) + [None] * (len(ch.sources) - len(ch.source_refs))
+            t.domains.append(ir.DomainDecl(
+                name=ch.name, kind=k, deriv=deriv, params=params,
+                sources=[self._dref(c, s, r) for s, r in zip(ch.sources, refs)]))
+        for a in c.dassocs:
+            if general and a.ctx:
+                continue
+            t.domain_assocs.append(ir.DomainAssoc(
+                target=[] if a.obj is c else a.obj.rel_path(c), kind=self._domain_kind(a.kname),
+                assoc=a.name, domain=self._dref(c, a.dom, a.ref)))
+        for drv in c.drivers:
+            t.domain_drivers.append(ir.DomainDriver(
+                domain=self._dref(c, drv.dom), signal=drv.sig.rel_path(c),
+                attr=_value_exprs(rt, drv.attr, drv.attr_type)))
+        for w in c.waivers:
+            t.domain_waivers.append(ir.DomainWaiver(
+                kind=self._domain_kind(w.kname), a=w.a.rel_path(c), b=w.b.rel_path(c),
+                reason=w.reason))
+        for (kn, assoc), port in c.pnames.items():
+            t.domain_port_names.append(ir.DomainPortName(
+                kind=self._domain_kind(kn), assoc=assoc, port=port))
+        for (kn, assoc), (p, pt, refs) in c.provs.items():
+            deriv, sources, params = _value_params(rt, p, pt, lambda o, r=None: self._dref(c, o, r),
+                                                   refs)
+            t.domain_provides.append(ir.DomainProvides(
+                kind=self._domain_kind(kn), assoc=assoc, deriv=deriv, sources=sources,
+                params=params))
+
+    def _port_names(self) -> None:
+        """Each kind's ``K::port_name(assoc, attr)`` for every association
+        name of the kind and every attribute value its pins, drivers and
+        ``pin_default()`` have (``DataTypeDomainKind.port_names``)."""
+        rt, d = self.rt, self.rt.dom
+        assocs: Dict[str, set] = {}
+        attrs: Dict[str, list] = {}
+        for c in rt.components:
+            for (kn, n) in c.assoc:
+                assocs.setdefault(kn, set()).add(n)
+            for drv in c.drivers:
+                attrs.setdefault(drv.dom.kname, []).append(drv.attr)
+            if c.extern is not None:
+                for dp in c.extern.dpins:
+                    attrs.setdefault(dp.kname, []).append(dp.attr)
+        # Association names the classes read (a named association read but
+        # set by no parent is still a port of the class).
+        for t in list(self.ctxt.type_m.values()):
+            for r in _domain_refs(t):
+                if r.kind is not None and r.decl is None:
+                    assocs.setdefault(r.kind, set()).add(r.assoc)
+            for pn in getattr(t, "domain_port_names", []):
+                assocs.setdefault(pn.kind, set()).add(pn.assoc)
+        for kn, k in self.ctxt.type_m.items():
+            if not isinstance(k, ir.DataTypeDomainKind) or not k.physical:
+                continue
+            dflt = d.pin_default(kn)
+            k.pin_default = _value_exprs(rt, dflt, None)
+            # A pin attribute named active_low is the polarity (fw_domain_kind).
+            k.polarity = "active_low" if "active_low" in k.pin_default else ""
+            for a in sorted(assocs.get(kn, set()) | {""}):
+                for v in [dflt] + attrs.get(kn, []):
+                    key = ir.port_name_key(a, _value_exprs(rt, v, None))
+                    if key not in k.port_names:
+                        k.port_names[key] = d.kind_port_name(kn, a, v)
 
     # -- interning --------------------------------------------------------
     def _intern(self, base: str, t, kind: str) -> str:
@@ -1273,6 +1467,96 @@ class IrMapper:
         self._sig[key] = name
         self.generic[name] = bool(getattr(t, "template_params", None))
         return name
+
+
+def _domain_refs(t):
+    """Every ``DomainRef`` written in IR type ``t``."""
+    out = []
+    for d in getattr(t, "domains", []):
+        out.extend(d.sources)
+        out.extend(v for v in d.params.values() if isinstance(v, ir.DomainRef))
+    out.extend(a.domain for a in getattr(t, "domain_assocs", []))
+    out.extend(d.domain for d in getattr(t, "domain_drivers", []))
+    for p in getattr(t, "domain_provides", []):
+        out.extend(p.sources)
+    for p in getattr(t, "pins", None) or []:
+        if p.domain is not None:
+            out.append(p.domain)
+    return [r for r in out if isinstance(r, ir.DomainRef)]
+
+
+def _domain_stmts(c: FwComponent, assocs: bool = True):
+    """``(what, traced frames)`` of each domain statement of ``c``'s code
+    (but associations, without ``assocs``)."""
+    for ch in c.children.values():
+        if isinstance(ch, FwDomain):
+            yield f"domain {ch.path}", ch.ctx
+    for a in (c.dassocs if assocs else ()):
+        yield f"the association of {a.obj.path} with {a.dom.path}", a.ctx
+    for d in c.drivers:
+        yield f"the driver of {d.dom.path}", d.ctx
+    for w in c.waivers:
+        yield f"the waiver of {w.a.path} and {w.b.path}", ()
+
+
+def _member_type(cls, name: str):
+    """The type ``name`` declared in ``cls`` or a base class (a typedef)."""
+    for k in ty.class_chain(cls):
+        m = k.find(name)
+        if m is not None and type(m).__name__ != "TransparentMemberSymbol":
+            return ty.canon(m)
+    return None
+
+
+def _field_type(t, name: str):
+    for f in (t or []):
+        if type(f).__name__ == "FieldSymbol" and f.name == name:
+            return ty.canon(f.type)
+    return None
+
+
+def _value_exprs(rt, v, t, dref=None) -> Dict[str, ir.Expr]:
+    """A struct value (a params value or pin attributes) as a field -> Expr
+    map: integral fields as constants, domain handles by ``dref``; null
+    handles are left out."""
+    out: Dict[str, ir.Expr] = {}
+    for k, x in v.items():
+        x = strip(x)
+        if isinstance(x, int):
+            out[k] = ir.ExprConstant(value=x)
+        elif dref is not None and x is not None and isinstance(rt.fw(x), FwDomain):
+            out[k] = dref(rt.fw(x))
+    return out
+
+
+def _decl_params(rt, d: FwDomain, dref):
+    """A domain object's derivation name and its params, but ``deriv`` and
+    ``from`` (the sources)."""
+    from .netlist import _value_text
+    pt = ty.canon(d.params_type)
+    dv = strip(d.params["deriv"])
+    deriv = _value_text(dv, _field_type(pt, "deriv")).lower()
+    params = _value_exprs(rt, d.params, pt, dref)
+    params.pop("deriv", None)
+    return deriv, params
+
+
+def _value_params(rt, v, t, dref, refs=()):
+    """A params value (``provides``) as ``DomainDecl`` writes one: the
+    derivation's name, its sources (``from``, through ``refs`` where the
+    code's refs are known) and its other params."""
+    from .netlist import _value_text
+    pt = ty.canon(t)
+    deriv = _value_text(strip(v["deriv"]), _field_type(pt, "deriv")).lower()
+    srcs = strip(v["from"]) if "from" in v.keys() else None
+    srcs = srcs if isinstance(srcs, list) else [srcs]
+    refs = list(refs) + [None] * (len(srcs) - len(refs))
+    sources = [dref(rt.fw(x), r) for x, r in zip(srcs, refs)
+               if x is not None and isinstance(rt.fw(x), FwDomain)]
+    params = _value_exprs(rt, v, pt, dref)
+    params.pop("deriv", None)
+    params.pop("from", None)
+    return deriv, sources, params
 
 
 def _open_pin_type(hp, hdr, params: Dict[str, Any], general: bool,
@@ -1521,11 +1805,37 @@ def _key(t) -> list:
     if isinstance(t, ir.DataTypeComponent):
         out.append([[_ekey(b.lhs), _ekey(b.rhs)] for b in t.bind_map])
         out.append([_ekey(g) for g in t.generates])
+        out.append([[d.name, d.kind, d.deriv, [_dkey(x) for x in d.sources],
+                     _dmap(d.params)] for d in t.domains])
+        out.append([[_pkey(a.target), a.kind, a.assoc, _dkey(a.domain)]
+                    for a in t.domain_assocs])
+        out.append([[_dkey(d.domain), _pkey(d.signal), _dmap(d.attr)]
+                    for d in t.domain_drivers])
+        out.append([[w.kind, _pkey(w.a), _pkey(w.b), w.reason] for w in t.domain_waivers])
+        out.append([[x.kind, x.assoc, x.port] for x in t.domain_port_names])
+        out.append([[x.kind, x.assoc, x.deriv, [_dkey(y) for y in x.sources], _dmap(x.params)]
+                    for x in t.domain_provides])
     if isinstance(t, ir.DataTypeExtern):
         out.append([t.extern_name, {k: _ekey(v) for k, v in t.extern_params.items()},
-                    [[p.name, p.path, _ekey(p.tie), p.open, _ekey(p.datatype)]
+                    [[p.name, p.path, _ekey(p.tie), p.open, _ekey(p.datatype),
+                      p.domain_kind, _dkey(p.domain), _dmap(p.domain_attr), p.output]
                      for p in t.pins]])
     return out
+
+
+def _pkey(path) -> list:
+    return [p if isinstance(p, str) else [p.name, _ekey(p.subscript)] for p in path]
+
+
+def _dkey(e) -> Any:
+    """:func:`_ekey`, with domain references."""
+    if isinstance(e, ir.DomainRef):
+        return ["dref", e.decl, e.kind, e.assoc, _pkey(e.target)]
+    return _ekey(e)
+
+
+def _dmap(m) -> dict:
+    return {k: _dkey(v) for k, v in m.items()}
 
 
 def to_ir(rt, parameterize: bool = True, require_param: bool = False) \
