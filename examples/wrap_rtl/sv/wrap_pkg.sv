@@ -17,6 +17,7 @@
 
 package wrap_pkg;
     import fw_hdl_pkg::*;
+    import fw_hdl_std_pkg::*;
 
     // fw_rv_fifo as a component. Its pins are named <in|out>_<data|vld|rdy>;
     // the map renames the bundle members valid/ready to vld/rdy, and in_data

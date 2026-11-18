@@ -6,6 +6,7 @@
 
 package gaps_pkg;
     import fw_hdl_pkg::*;
+    import fw_hdl_std_pkg::*;
 
     // A shape: the widths of a component or bundle, grouped in one
     // struct-valued class parameter (§3.9).

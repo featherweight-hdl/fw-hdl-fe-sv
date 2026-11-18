@@ -49,7 +49,7 @@ def test_pin_out_wrapper():
     assert [(d.name, d.deriv, [_ref(s) for s in d.sources]) for d in t.domains] == [
         ("clk", "root", []), ("slow", "derived", [("clk", None, "", [])])]
     slow = t.domains[1]
-    assert {k: v.value for k, v in slow.params.items()} == {"div": 2, "mul": 1, "phase_deg": 0}
+    assert {k: v.value for k, v in slow.params.items()} == {"div": 2, "mul": 1, "phase_deg": 0, "period": 0}
     assert [(a.target, a.assoc, _ref(a.domain)) for a in t.domain_assocs] == [
         ([], "", ("clk", None, "", [])),
         (["u"], "out", ("slow", None, "", [])),
@@ -347,7 +347,7 @@ def test_provides_in_ir():
     p = ctxt.type_m["div2"].domain_provides
     assert [(x.kind, x.assoc, x.deriv) for x in p] == [("fw_clock_kind", "out", "derived")]
     assert _ref(p[0].sources[0]) == (None, "fw_clock_kind", "", [])
-    assert {k: v.value for k, v in p[0].params.items()} == {"div": 2, "mul": 1, "phase_deg": 0}
+    assert {k: v.value for k, v in p[0].params.items()} == {"div": 2, "mul": 1, "phase_deg": 0, "period": 0}
 
 
 HIER = """

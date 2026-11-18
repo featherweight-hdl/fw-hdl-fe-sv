@@ -160,8 +160,20 @@ class Api:
     @property
     def incdirs(self) -> List[str]:
         """fe-sv's directories first, so its macros and package win."""
-        return [str(self.bodies_dir), str(SHARE_SV), str(self.spec / "bindings" / "sv")]
+        return [str(self.bodies_dir), str(SHARE_SV), str(self.spec / "bindings" / "sv"),
+                str(self.spec / "std")]
+
+    @property
+    def std_file(self) -> str:
+        """The standard library's source (``fw_hdl_std_pkg``: ``fw_rv_if``, ...)."""
+        return str(self.spec / "std" / "fw_hdl_std_pkg.sv")
 
     @property
     def files(self) -> List[str]:
-        return [str(SHARE_SV / "fw_hdl_pkg.sv")]
+        """The API's package, then the standard library's."""
+        return [str(SHARE_SV / "fw_hdl_pkg.sv"), self.std_file]
+
+    def sources(self, files) -> List[str]:
+        """:attr:`files`, then ``files`` (std's source once, if given too)."""
+        std = os.path.realpath(self.std_file)
+        return self.files + [f for f in files if os.path.realpath(f) != std]

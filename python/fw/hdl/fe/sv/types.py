@@ -4,30 +4,54 @@ from __future__ import annotations
 from typing import Iterator, Optional
 
 API_PACKAGE = "fw_hdl_pkg"
+#: The standard library (fw-hdl-spec std/), compiled with the API.
+STD_PACKAGE = "fw_hdl_std_pkg"
 
 
 def canon(t):
     return t.canonicalType if t is not None and hasattr(t, "canonicalType") else t
 
 
-def type_name(t) -> str:
+def type_name(t, aliases: bool = False) -> str:
     """The canonical spelling of a type, as the netlist uses it: a class
     specialization is its name and its parameters' values, with type
     parameters spelled the same way, ``fifo_chain#(bit[7:0])``; any other
-    type as slang prints its canonical form."""
-    t = canon(t)
-    if t is None:
+    type as slang prints its canonical form. With ``aliases``, a typedef
+    is spelled by its name: ``test_put_if#(uart_char_t)``."""
+    if aliases and type(t).__name__ == "TypeAliasType" and not _type_param_alias(t):
+        return t.name
+    c = canon(t)
+    if c is None:
         return "?"
+    if getattr(c, "isStruct", False) or getattr(c, "isEnum", False) or \
+            getattr(c, "isPackedUnion", False) or getattr(c, "isUnpackedUnion", False):
+        # Nominal types keep the name of the typedef nearest them, as in the
+        # netlist (``fw_rv_proto#(aw_t)``).
+        name = None
+        while getattr(t, "isAlias", False):
+            name = t.name
+            t = t.targetType.type
+        if name:
+            return name
+    t = c
     if getattr(t, "isClass", False) and t.genericClass is not None:
         vals = []
         for m in t:
             k = type(m).__name__
             if k == "TypeParameterSymbol":
-                vals.append(type_name(m.targetType.type))
+                vals.append(type_name(m.targetType.type, aliases))
             elif k == "ParameterSymbol" and not m.isLocalParam:
                 vals.append(str(m.value))
         return f"{t.name}#({','.join(vals)})" if vals else t.name
     return str(t).replace(" ", "")
+
+
+def _type_param_alias(t) -> bool:
+    """A type parameter's alias (``T`` in ``fw_put_if #(T)``): spelled by
+    its value, not its name."""
+    p = getattr(t, "parentScope", None)
+    m = p.find(t.name) if p is not None else None
+    return type(m).__name__ == "TypeParameterSymbol"
 
 
 def class_chain(cls) -> Iterator:

@@ -200,9 +200,12 @@ def resolve(rt) -> None:
     for c in rt.components:
         if c.is_extern and c.extern is not None:
             check_extern(rt, c)
-    from .domains import check as domain_check, passes as domain_passes
+    from .domains import check as domain_check, check_binds, passes as domain_passes
     domain_check(rt)
+    rt.check_api()
+    rt.check_cfg()
     if not rt.force:          # not an explore() run: its domains are borrowed
+        check_binds(rt)
         domain_passes(rt)
 
 
@@ -210,6 +213,57 @@ def resolve(rt) -> None:
 
 def _flat(path: List[str]) -> str:
     return "_".join(path)
+
+
+class FieldPin:
+    """A field of a packed-struct port that a field-wise rule maps to its
+    own pin (extern.md rule 2 "Fields"): reads like the port, its path
+    going on into the struct (``aw.data.addr``)."""
+
+    def __init__(self, sig: FwSignal, fields: List[str], dtype):
+        self.sig, self.fields, self.dtype = sig, fields, dtype
+        self.width = int(dtype.bitWidth)
+
+    @property
+    def path(self) -> str:
+        return ".".join([self.sig.path] + self.fields)
+
+    @property
+    def scope(self) -> FwComponent:
+        return self.sig.scope
+
+    def rel_path(self, scope: FwComponent) -> List[str]:
+        return self.sig.rel_path(scope) + self.fields
+
+    def effective_dir(self) -> Optional[str]:
+        return self.sig.effective_dir()
+
+
+def _struct_fields(t) -> list:
+    """The fields of packed struct type ``t``, most significant first;
+    empty for any other type."""
+    from .types import canon
+    t = canon(t)
+    if type(t).__name__ != "PackedStructType":
+        return []
+    return [f for f in t if type(f).__name__ == "FieldSymbol"]
+
+
+def _field_pins(prefix: str, renames: Dict[str, str], path: List[str], sig: FwSignal,
+                t, fields: List[str]):
+    """(pin, FieldPin) for each field of ``t``, the type of member ``path``:
+    the rename of the field's path, else, when a rename goes into a packed
+    struct field, its fields, else ``prefix`` + the flat path."""
+    from .types import canon
+    for f in _struct_fields(t):
+        fp, ff = path + [f.name], fields + [f.name]
+        key = ".".join(fp)
+        if key in renames:
+            yield prefix + renames[key], FieldPin(sig, ff, canon(f.type))
+        elif _struct_fields(f.type) and any(k.startswith(key + ".") for k in renames):
+            yield from _field_pins(prefix, renames, fp, sig, f.type, ff)
+        else:
+            yield prefix + _flat(fp), FieldPin(sig, ff, canon(f.type))
 
 
 def extern_ports(c: FwComponent) -> List[Tuple[List[str], FwSignal]]:
@@ -274,6 +328,13 @@ def pin_map(rt, c: FwComponent):
     for r in rec.rules:
         for path, s in extern_ports_of(r.bundle):
             if id(s) in mapped:
+                continue
+            key = ".".join(path)
+            if _struct_fields(s.dtype) and any(k.startswith(key + ".") for k in r.renames):
+                # Field-wise: a rename goes into the member's packed struct.
+                for pin, fp in _field_pins(r.prefix, r.renames, path, s, s.dtype, []):
+                    put(pin, ("port", fp))
+                mapped.add(id(s))
                 continue
             put(r.prefix + r.renames.get(".".join(path), _flat(path)), ("port", s))
             mapped.add(id(s))

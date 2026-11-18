@@ -16,6 +16,7 @@ and checks that they match on every cycle.
 | `sv/wrap_pkg.sv` | The fw-hdl description: wrappers `rv_fifo` and `axis_slice`, and the assembly `chain`. |
 | `tb/chain_ref.sv` | The same assembly wired by hand: the reference. |
 | `tb/chain_tb.sv` | Random stimulus and back-pressure; compares `chain` with `chain_ref` and checks stream order. |
+| `tb/chain_accept_tb.sv` | All-RTL reference for the generated testbench: drives `chain_ref` with a given sequence and prints the cycle of each handshake. |
 | `flow.yaml` | `fw.hdl.fe.sv.Elaborate` → `fw.hdl.fe.sv.EmitSV` → Verilator. |
 
 ## The wrappers
@@ -89,3 +90,32 @@ In `chain.sv` the domains are nets, `clk` and `rst`, driven from `clk_i`
 and `rst_i`. The FIFO's `rst` reads `rst`; the slice's active-low
 `aresetn` reads `rst_inv`, which emission declares as `~rst`. The
 reference, `tb/chain_ref.sv`, wires the same inverter by hand.
+
+## A generated testbench
+
+`chain`'s ports are ready/valid bundles, so fw-hdl knows the transactor
+for each, and the testbench can be generated rather than written:
+
+```python
+r = elaborate(["sv/wrap_pkg.sv"], top="wrap_pkg::chain#(bit[7:0])", rtl=[...])
+s = scan([".../fw_hdl_std_pkg.sv"], incdirs=[...])
+tb_sv   = gen_tb(r, s, "chain", bind=True)   # chain_tb_pkg::chain_tb_c + module chain_tb
+bind_sv = gen_bind(r, s, "chain")            # chain_fw_mon + bind chain ...
+```
+
+`chain_tb_c` holds an initiator `dut_in` for the DUT's `in`, a target
+`dut_out` that puts what it receives into the inbox `dut_out_rx`, the
+clock and reset, and (with `bind=True`) the monitors `mon_in` and
+`mon_out`, fed by the bound module `chain_fw_mon`, which only reads the
+DUT's pins. Module `chain_tb #(type TB)` holds `chain` and the bridges
+between its pins and the class. A test extends `chain_tb_c`, calls
+`dut_in.put(...)` and `dut_out_rx.get(...)` in `run()`, adds listeners
+to the monitors in `connect()`, and instances `chain_tb #(.TB(test_c))`.
+
+fe-sv's `tests/e2e/test_wrap_rtl_acceptance.py` checks that this adds no
+latency: it drives 48 random items with input gaps and output
+back-pressure through the generated testbench, scores in = out in order
+on the monitors' listeners, and compares the cycle of every handshake
+with `tb/chain_accept_tb.sv` driving `chain_ref` with the same sequence.
+All 96 handshakes match. `tests/e2e/test_gen_tb.py` and
+`test_gen_bind.py` are smaller examples of the same bench.

@@ -117,8 +117,9 @@ def elaborate(files: Sequence[str], top: str, *,
     sev = severity_option(domain_severity)        # ValueError on a bad option
     api = Api(spec)
     text = f"module {TOP_MODULE}; typedef {top} __fw_top_t; endmodule\n"
-    cres = sv_compile(api.files + list(files), incdirs=api.incdirs + list(incdirs),
-                      defines=defines or {}, extra_text={"__fw_fe_sv_top.sv": text})
+    cres = sv_compile(api.sources(files), incdirs=api.incdirs + list(incdirs),
+                      defines=defines or {}, extra_text={"__fw_fe_sv_top.sv": text},
+                      timescale="1ns/1ps")
     comp, sv_diags = cres
     if sv_diags.has_errors:
         return ElabResult(None, [Diag("FW-E-SV", "<compile>", sv_diags.report())])

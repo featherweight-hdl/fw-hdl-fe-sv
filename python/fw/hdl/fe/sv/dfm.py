@@ -45,6 +45,42 @@ def _error(msg: str) -> TaskMarker:
     return TaskMarker(msg=msg, severity=SeverityE.Error)
 
 
+def _scan_tables(input: TaskDataInput) -> list:
+    """The ``protocols`` tables of the ``fwHdlScan`` inputs (a ``Scan`` upstream)."""
+    out = []
+    for fs in getattr(input, "inputs", []) or []:
+        if getattr(fs, "filetype", None) != "fwHdlScan":
+            continue
+        for f in fs.files:
+            if os.path.basename(f) == "scan.json":
+                with open(os.path.join(fs.basedir, f)) as fp:
+                    out.append(json.load(fp).get("protocols", {}))
+    return out
+
+
+def _scan_check(protos: dict, scanned: dict) -> list:
+    """Where the elaborated ``protocols`` disagree with a scan of the same sources.
+
+    The scan sees every registered bundle and converter but only named
+    specializations; elaboration sees what the top uses. So a protocol the
+    scan lacks is fine; for one it has, the declaration must match and the
+    elaborated bundles and converters must be among the scanned ones."""
+    out = []
+    for name, p in sorted(protos.items()):
+        s = scanned.get(name)
+        if s is None:
+            continue
+        diff = [k for k in ("family", "params", "prefix", "apis") if p.get(k) != s.get(k)]
+        if not set(p.get("bundles", [])) <= set(s.get("bundles", [])):
+            diff.append("bundles")
+        if any(c not in s.get("converters", []) for c in p.get("converters", [])):
+            diff.append("converters")
+        if diff:
+            out.append(_error(f"FW-E-SCAN-STALE: {name}: elaboration and the scan differ "
+                              f"in {', '.join(diff)}; re-run Scan"))
+    return out
+
+
 async def Elaborate(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
     from zuspec.ir.core.serializer import IRSerializer
     from .elab import elaborate
@@ -72,17 +108,87 @@ async def Elaborate(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
         return TaskDataResult(status=1, changed=True, output=[],
                               markers=markers + _diag_markers(r.ir_diags) + [_error(str(e))])
     markers += _diag_markers(r.ir_diags)
+    nl = r.netlist()
+    stale = [m for t in _scan_tables(input) for m in _scan_check(nl.get("protocols", {}), t)]
+    if stale:
+        return TaskDataResult(status=1, changed=True, output=[], markers=markers + stale)
     with open(os.path.join(rundir, "design.zir"), "w") as f:
         f.write(IRSerializer().serialize(ctx, None))
     with open(os.path.join(rundir, "design.json"), "w") as f:
         json.dump({"ir": "design.zir", "top": top}, f, indent=2)
     with open(os.path.join(rundir, "netlist.json"), "w") as f:
-        json.dump(r.netlist(), f, indent=2, sort_keys=True)
+        json.dump(nl, f, indent=2, sort_keys=True)
         f.write("\n")
     return TaskDataResult(status=0, changed=True, markers=markers, output=[
         FileSet(src=input.name, filetype="zuspecIR", basedir=rundir, files=["design.json", "design.zir"]),
         FileSet(src=input.name, filetype="fwHdlNetlist", basedir=rundir, files=["netlist.json"])]
         + _rtl_filesets(input))
+
+
+async def Scan(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
+    from zuspec.ir.core.serializer import IRSerializer
+    from .scan import scan
+    p = input.params
+    files, incdirs, defines = _inputs(input, ("fwHdlSource",))
+    if not files:
+        return TaskDataResult(status=1, changed=False, output=[],
+                              markers=[_error("no fwHdlSource input")])
+    r = scan(files, incdirs=incdirs, defines=defines, spec=p.spec or None)
+    markers = _diag_markers(r.diags)
+    if not r.ok:
+        return TaskDataResult(status=1, changed=True, output=[], markers=markers)
+    ctx, ir_diags = r.to_ir()
+    markers += _diag_markers(ir_diags)
+    rundir = input.rundir
+    os.makedirs(rundir, exist_ok=True)
+    with open(os.path.join(rundir, "scan.zir"), "w") as f:
+        f.write(IRSerializer().serialize(ctx, None))
+    with open(os.path.join(rundir, "scan.json"), "w") as f:
+        json.dump({"ir": "scan.zir", "protocols": r.table(), "classes": r.classes},
+                  f, indent=2, sort_keys=True)
+        f.write("\n")
+    srcs = [fs for fs in getattr(input, "inputs", []) or []
+            if getattr(fs, "filetype", None) == "fwHdlSource"]
+    return TaskDataResult(status=0, changed=True, markers=markers, output=srcs + [
+        FileSet(src=input.name, filetype="fwHdlScan", basedir=rundir,
+                files=["scan.json", "scan.zir"])] + _rtl_filesets(input))
+
+
+async def GenKit(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
+    import re
+    from fw.hdl.gen import GEN_VERSION, GenError, gen_kit
+    from .scan import scan
+    p = input.params
+    files, incdirs, defines = _inputs(input, ("fwHdlSource",))
+    if not files:
+        return TaskDataResult(status=1, changed=False, output=[],
+                              markers=[_error("no fwHdlSource input")])
+    r = scan(files, incdirs=incdirs, defines=defines, spec=p.spec or None)
+    markers = _diag_markers(r.diags)
+    if not r.ok:
+        return TaskDataResult(status=1, changed=True, output=[], markers=markers)
+    try:
+        sv = gen_kit(r, pkg_name=p.pkg_name or None)
+    except GenError as e:
+        return TaskDataResult(status=1, changed=True, output=[], markers=markers + [_error(str(e))])
+    pkg = re.search(r"^package\s+(\w+)\s*;", sv, re.M).group(1)
+    rundir = input.rundir
+    os.makedirs(rundir, exist_ok=True)
+    with open(os.path.join(rundir, f"{pkg}.sv"), "w") as f:
+        f.write(sv)
+    srcs = [fs for fs in getattr(input, "inputs", []) or []
+            if getattr(fs, "filetype", None) == "fwHdlSource"]
+    return TaskDataResult(status=0, changed=True, markers=markers,
+                          memento={"gen_version": GEN_VERSION}, output=srcs + [
+        FileSet(src=input.name, filetype="systemVerilogSource", basedir=rundir,
+                files=[f"{pkg}.sv"])] + _rtl_filesets(input))
+
+
+async def GenKitUpToDate(ctxt) -> bool:
+    """``GenKit`` is stale when the generators changed since it ran
+    (``GEN_VERSION``), as well as when its inputs or parameters did."""
+    from fw.hdl.gen import GEN_VERSION
+    return (ctxt.memento or {}).get("gen_version") == GEN_VERSION
 
 
 async def EmitSV(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:

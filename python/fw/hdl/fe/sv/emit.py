@@ -37,7 +37,7 @@ def emit_sv(ctxt: ir.Context, top: str, out_dir, *, extern_files: Sequence[str] 
                 if isinstance(f.datatype, ir.DataTypeRef) and f.datatype.ref_name == top:
                     f.datatype.ref_name = top_module
         top = top_module
-    flatten_structure(ctxt)
+    flatten_structure(ctxt, top=top)
     # The packed structs and enums the ports use: one package, named after
     # the top (§6.5).
     pkg = f"{sv_module_name(top)}_types_pkg"

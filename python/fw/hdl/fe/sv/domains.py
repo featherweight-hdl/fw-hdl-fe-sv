@@ -35,8 +35,8 @@ from zuspec.synth.passes.domains import relate as _relate
 
 from . import types as ty
 from . import values as vx
-from .objects import (Assoc, DomPin, Driver, FwBundle, FwComponent, FwDomain, FwObject,
-                      FwSignal, Waiver)
+from .objects import (Assoc, Diag, DomPin, Driver, FwBundle, FwComponent, FwDomain,
+                      FwObject, FwSignal, Waiver)
 
 CLOCK = "fw_clock_kind"
 RESET = "fw_reset_kind"
@@ -459,6 +459,41 @@ def check(rt) -> None:
 
 
 
+def check_binds(rt) -> None:
+    """The crossing check of every api and cfg binding (rt-sv's
+    ``__fw_rt_proto::check_cross``): the endpoints' domains are their own
+    associations, else their component's. Not a Zuspec pass: the IR's nets
+    carry no bindings. Matched waivers are marked for :func:`passes`."""
+    crossed = set()
+    for bd in rt.binds:
+        if bd.kind not in ("api", "cfg"):
+            continue
+        ia, ib = iface(bd.a), iface(bd.b)
+        if ia is ib:
+            continue
+        lo, hi = (ia, ib) if ia.path < ib.path else (ib, ia)
+        for kn in sorted(rt.dom.kinds):
+            da, db = get(bd.a, kn), get(bd.b, kn)
+            pk = (kn, lo.path, hi.path)
+            if da is None or db is None or da is db or pk in crossed:
+                continue
+            rel = relate(da, db)
+            sev = rt.dom.severity_opt.get(kn, {}).get(rel.name.lower()) \
+                or rt.dom.severity(kn, rel)
+            if sev == "none":
+                continue
+            crossed.add(pk)
+            hit = [w for w in rt.dom.waivers if w.scope is bd.scope and w.kname == kn
+                   and {w.a.path, w.b.path} == {lo.path, hi.path}]
+            for w in hit:
+                w.matched = True
+            if hit:
+                continue
+            rt.diags.append(Diag(f"FW-{sev[0].upper()}-DOM-CROSS", lo.path,
+                                 f"{kn} crossing from {da.path} to {db.path} ({hi.path})",
+                                 sev))
+
+
 def passes(rt) -> None:
     """The Zuspec domain passes (relation, resolution, crossing,
     realization) over the design's concrete IR; their diagnostics become
@@ -466,7 +501,6 @@ def passes(rt) -> None:
     emission. ``rt.dom.severity_opt`` overrides kinds' crossing severities."""
     from zuspec.synth.passes.domains import Resolution, check_crossings, realize
     from .ir_map import to_ir
-    from .objects import Diag
     if rt.top is None or not rt.dom.kinds:
         return
     try:
@@ -479,5 +513,8 @@ def passes(rt) -> None:
             rt.error("FW-E-ELAB", rt.top.path, f"domain passes: {e}")
         return
     rt.dom.realization = r
+    bound = {w.a.path for w in rt.dom.waivers if w.matched}     # matched by check_binds
     for d in found + r.diags:
+        if d.id == "FW-W-DOM-WAIVE" and d.path in bound:
+            continue
         rt.diags.append(Diag(d.id, d.path, d.msg, d.severity))

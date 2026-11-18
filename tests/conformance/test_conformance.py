@@ -18,7 +18,7 @@ from fw.hdl.fe.sv.netlist import canonical
 
 # The optional features of the spec that fe-sv implements (meta.json
 # "features").
-FEATURES = {"domains"}
+FEATURES = {"domains", "protocols"}
 
 # Scenarios that need a part of a feature still to come
 # (core-domains-plan.md §9). None now; kept for the steps ahead.
@@ -42,7 +42,8 @@ def test_scenario(d: Path):
     if d.name in PENDING:
         pytest.skip("needs " + PENDING[d.name])
     expect = json.loads((d / "expect.json").read_text())
-    r = elaborate([str(d / "top.sv")], top="scenario::top", incdirs=[str(d)],
+    r = elaborate([str(d / "top.sv")], top="scenario::top",
+                  incdirs=[str(d), str(d.parent / "_lib")],
                   rtl=[str(d / f) for f in meta.get("rtl", [])])
     assert r.rt is not None, "\n".join(map(str, r.diags))
     got = r.netlist()

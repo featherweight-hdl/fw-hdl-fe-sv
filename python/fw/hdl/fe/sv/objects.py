@@ -17,6 +17,9 @@ BUNDLE = "bundle"
 MIRROR = "mirror"
 MONITOR = "monitor"
 DOMAIN = "domain"
+API = "api_endpoint"
+CFG_PUB = "cfg_src"
+CFG_CONS = "cfg_sink"
 BUNDLE_KINDS = (BUNDLE, MIRROR, MONITOR)
 
 
@@ -48,6 +51,7 @@ class FwObject:
     # The path of a top elaborated on its own to explore another arm of a
     # branch (FeRt.explore): the path of the component it stands for.
     path_alias: Optional[str] = None
+    proto: Any = None           # protocols.ProtoRec: a bundle's protocol, a transactor's
     # Domains (domains.py): the associations set on this object, by
     # (kind name, association name), each an ``Assoc``; and the named
     # associations read with get().
@@ -209,6 +213,50 @@ class FwDomain(FwObject):
     drivers: List["Driver"] = dc.field(default_factory=list)
     realized: bool = False
     detached: bool = False
+
+
+@dc.dataclass(eq=False)
+class FwEndpoint(FwObject):
+    """An API endpoint (protocols.md, "Endpoints and sockets"): an
+    ``fw_port``, an ``fw_export`` or an ``fw_socket #(OUT, IN)``. ``out``:
+    has a port side (port, socket), which must resolve; ``sock``: a socket.
+    ``up``: the endpoint this one is bound to (port connect, connect_up);
+    ``peer``: a socket's peer socket (connect, both ways). A configured
+    endpoint (``fw_port_cfg_src`` and the rest) has ``cfg`` "src" or
+    "sink", ``tkey`` (the spelling of CFG), and, as a source, ``value``
+    (its last ``set()``); a sink's ``src`` is the source it resolves to."""
+    kind: str = API
+    out: bool = False
+    sock: bool = False
+    must: bool = False
+    up: Optional["FwEndpoint"] = None
+    peer: Optional["FwEndpoint"] = None
+    api: str = ""               # fw_socket, fw_port, fw_export (a configured one's base)
+    cfg: str = ""               # "", "src" or "sink"
+    tkey: str = ""
+    value: Any = None
+    src: Optional[FwObject] = None
+
+
+@dc.dataclass(eq=False)
+class FwCfg(FwObject):
+    """A ``fw_cfg_src`` or ``fw_cfg_sink`` (protocols.md, "Configuration").
+    ``tkey``: the spelling of T. A source's ``value`` is its last
+    ``set()``. A sink's ``src`` is the source it resolves to (FeRt.check_cfg)."""
+    tkey: str = ""
+    value: Any = None
+    src: Optional[FwObject] = None
+
+
+@dc.dataclass
+class Binding:
+    """One ``bindings`` entry: an api (or cfg) binding made in ``scope``;
+    ``up``: made by ``connect_up``."""
+    kind: str
+    a: FwObject
+    b: FwObject
+    scope: Optional["FwComponent"]
+    up: bool = False
 
 
 @dc.dataclass

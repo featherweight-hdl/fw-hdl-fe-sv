@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from zuspec.fe.sv.interp.values import Obj, Struct, const_to_py
 
 from . import types as ty
-from .objects import FwBundle, FwComponent, FwDomain, FwObject, FwSignal
+from .objects import FwBundle, FwCfg, FwComponent, FwDomain, FwEndpoint, FwObject, FwSignal
 from .resolve import endpoint_kind
 
 
@@ -183,12 +183,24 @@ def _object_l1(rt, o: FwObject) -> Dict[str, Any]:
                                             for u in getattr(rec, "unused_ports", []))}
         return d
     if isinstance(o, FwBundle):
-        return {"path": o.path, "kind": o.kind, "type": spell(o.btype)}
+        d = {"path": o.path, "kind": o.kind, "type": spell(o.btype)}
+        if getattr(o, "proto", None) is not None:
+            d["protocol"] = o.proto.name
+            d["role"] = _ROLE[o.kind]
+        return d
+    if isinstance(o, (FwEndpoint, FwCfg)):
+        d = {"path": o.path, "kind": o.kind, "type": spell(o.cls)}
+        if o.proto is not None:
+            d["protocol"] = o.proto.name
+        return d
     s: FwSignal = o
     if s.is_port:
         return {"path": s.path, "kind": "port", "type": spell(s.dtype),
                 "dir": s.effective_dir(), "width": s.width}
     return {"path": s.path, "kind": "signal", "type": spell(s.dtype), "width": s.width}
+
+
+_ROLE = {"bundle": "initiator", "mirror": "target", "monitor": "monitor"}
 
 
 def _walk(o: FwObject, out: List[FwObject]) -> None:
@@ -217,12 +229,19 @@ def netlist(rt) -> Dict[str, Any]:
     nets.sort(key=lambda n: (n["scope"], min(
         [p for p in [n["source"]] if p] + n["sinks"] + n["signals"] + n["inouts"])))
     diags = sorted({(d.id, d.path) for d in rt.diags}, key=lambda x: (x[1], x[0]))
-    return {
+    out = {
         "top": spell(rt.top.cls) if rt.top is not None else "",
         "objects": sorted((_object(rt, o) for o in objs), key=lambda d: d["path"]),
         "nets": nets,
         "diagnostics": [{"id": i, "path": p} for i, p in diags],
     }
+    binds = sorted({(b.a.path, b.b.path, b.kind) for b in rt.binds})
+    if binds:
+        out["bindings"] = [{"kind": k, "from": a, "to": b} for a, b, k in binds]
+    protos = rt.proto.table()
+    if protos:
+        out["protocols"] = protos
+    return out
 
 
 def canonical(nl) -> str:

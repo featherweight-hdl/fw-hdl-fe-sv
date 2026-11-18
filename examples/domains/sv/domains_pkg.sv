@@ -21,6 +21,7 @@
 
 package domains_pkg;
     import fw_hdl_pkg::*;
+    import fw_hdl_std_pkg::*;
 
     // clk_div2: clk_o is clk_i divided by 2. The divider's own clock is its
     // default; the clock it produces is its association "out".

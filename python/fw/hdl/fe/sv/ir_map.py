@@ -75,8 +75,8 @@ from zuspec.fe.sv.interp.trace import leaves
 from zuspec.fe.sv.interp.values import Sym, strip
 
 from . import types as ty
-from .objects import (BUNDLE, MIRROR, MONITOR, Diag, FwBundle, FwComponent, FwDomain,
-                      FwObject, FwSignal)
+from .objects import (BUNDLE, BUNDLE_KINDS, MIRROR, MONITOR, CFG_CONS, CFG_PUB, Diag,
+                      FwBundle, FwCfg, FwComponent, FwDomain, FwEndpoint, FwObject, FwSignal)
 from . import domains as dm
 
 _ROLE = {BUNDLE: ir.BundleRole.INITIATOR, MIRROR: ir.BundleRole.MIRROR,
@@ -149,6 +149,40 @@ def _base_name(cls) -> str:
     return c.genericClass.name if getattr(c, "genericClass", None) is not None else c.name
 
 
+def _field_refs(x, used: Optional[set], remap: Optional[Dict[int, int]] = None) -> None:
+    """Each ``ExprRefField`` on ``self`` in ``x`` (process blocks): its
+    index added to ``used``, or moved by ``remap``."""
+    import dataclasses as dc
+    if isinstance(x, ir.ExprRefField) and isinstance(x.base, ir.TypeExprRefSelf):
+        if used is not None:
+            used.add(x.index)
+        if remap is not None:
+            x.index = remap[x.index]
+    if isinstance(x, list):
+        for e in x:
+            _field_refs(e, used, remap)
+    elif dc.is_dataclass(x) and not isinstance(x, (type, ir.DataType)):
+        for f in dc.fields(x):
+            v = getattr(x, f.name)
+            if isinstance(v, list) or (dc.is_dataclass(v) and not isinstance(v, type)):
+                _field_refs(v, used, remap)
+
+
+def _assigned(body: list, out: set) -> None:
+    """The indexes of the ``self`` fields ``body`` assigns (a target's root:
+    ``n`` of ``n[i]``)."""
+    for s in body:
+        if isinstance(s, ir.StmtAssign):
+            for t in s.targets:
+                while isinstance(t, (ir.ExprSubscript, ir.ExprAttribute)):
+                    t = t.value
+                if isinstance(t, ir.ExprRefField) and isinstance(t.base, ir.TypeExprRefSelf):
+                    out.add(t.index)
+        elif isinstance(s, ir.StmtIf):
+            _assigned(s.body, out)
+            _assigned(s.orelse, out)
+
+
 def _port(s: FwSignal, dtype: ir.DataType, name: Optional[str] = None) -> ir.Field:
     name = s.name if name is None else name
     if s.dir is None:
@@ -211,6 +245,8 @@ def _ekey(e) -> Any:
                 [_ekey(x) for x in e.orelse]]
     if isinstance(e, ir.Field):
         return _field_key(e)
+    if isinstance(e, ir.ProtocolRef):
+        return ["proto", e.family, {k: _ekey(v) for k, v in e.params.items()}]
     if isinstance(e, ir.DomainAssoc):
         return ["dassoc", _pkey(e.target), e.kind, e.assoc, _dkey(e.domain)]
     raise TypeError(f"no key for {type(e).__name__}")
@@ -494,6 +530,7 @@ class IrMapper:
     def run(self) -> Tuple[ir.Context, str]:
         top = self._component(self.rt.top)
         self._port_names()
+        self._hubs()
         return self.ctxt, top
 
     # -- types --------------------------------------------------------------
@@ -797,10 +834,77 @@ class IrMapper:
                                       rhs=ir.ExprConstant(value=tie.value, width=tie.sig.width)))
         try:
             self._domains(c, t)
+            self._protocols(c, t)
         except NotParam as e:
             from .rt import ElabError
             raise ElabError(str(e))
+        self._procs(c, t)
         return t
+
+    def _procs(self, c: FwComponent, t: ir.DataTypeComponent) -> None:
+        """``c``'s step and comb blocks (zuspec-fe-sv ``ProcMapper``, as a
+        back end lowering to RTL sees them) as ``t.proc_blocks``. The class
+        properties they use that are not yet fields (component state) are
+        added as fields. A step block runs in the component's clock domain
+        and, when it has a reset branch or reads ``in_reset``, its reset
+        domain (``DomainRef`` with ``target=[]``); one that writes a
+        signal set to another clock domain runs in that one."""
+        from zuspec.fe.sv.error import ErrorSeverity, ErrorReporter
+        from zuspec.fe.sv.proc_mapper import ProcMapper, field_index
+        from zuspec.synth.passes.domains.ports import _in_resets
+        names = {f.name: i for i, f in enumerate(t.fields)}
+        state = []
+        for n in field_index(c.cls):
+            if n in names:
+                continue
+            m = c.cls.find(n)
+            mt = getattr(m, "type", None)
+            if mt is None or not getattr(mt, "isIntegral", False):
+                continue
+            names[n] = len(t.fields) + len(state)
+            state.append(ir.Field(name=n, datatype=self._type(mt)))
+        rep = ErrorReporter()
+        blocks = ProcMapper(reporter=rep, fields=names, emit=True).map(c.cls)
+        for e in rep.errors:
+            code, _, msg = e.message.partition(": ")
+            if not code.startswith("FW-"):
+                code, msg = "FW-E-PROC", e.message
+            sev = "error" if e.severity == ErrorSeverity.ERROR else "warning"
+            path = c.path
+            if code == "FW-E-WRITE-MULTI":
+                # "<class>.<written path>: written by ..."
+                where, _, msg = msg.partition(": ")
+                path = f"{c.path}.{where.partition('.')[2]}"
+            self.diags.append(Diag(code, path, msg, sev))
+        # FW-E-WRITE-IN: a block writes a port that is an input as seen
+        # from the component (a mirror's valid, say)
+        for b in blocks:
+            for p in b.writes:
+                o = c
+                for n in p:
+                    o = getattr(o, "children", {}).get(n)
+                if isinstance(o, FwSignal) and o.effective_dir() == "in":
+                    self.diags.append(Diag("FW-E-WRITE-IN", ".".join([c.path] + p),
+                                           f"block '{b.name}' writes an input"))
+        if not blocks:
+            return
+        used = set()
+        _field_refs(blocks, used)
+        keep = [f for f in state if names[f.name] in used]
+        t.fields = list(t.fields) + keep
+        new_ix = {f.name: i for i, f in enumerate(t.fields)}
+        _field_refs(blocks, None, {names[n]: i for n, i in new_ix.items()})
+        kept = {new_ix[f.name] for f in keep}
+        for b in blocks:
+            if b.kind != ir.ProcKind.STEP:
+                continue
+            w = set()
+            _assigned(b.reset_body + b.body, w)
+            b.state = [t.fields[i].name for i in sorted(w & kept)]
+            b.clock = _write_clock(t, b)
+            if b.reset_body or any(True for _ in _in_resets(b.body)):
+                b.reset = ir.DomainRef(kind="fw_reset_kind", target=[])
+        t.proc_blocks = blocks
 
     def _arrays_of(self, o) -> set:
         """The array fields (by name) of a component's IR type."""
@@ -846,6 +950,8 @@ class IrMapper:
         t.generates = [x for x in root if isinstance(x, (ir.GenerateFor, ir.GenerateIf))]
         _check_names(t)
         self._domains(c, t, general=True)
+        self._protocols(c, t, general=True)
+        self._procs(c, t)
         return t
 
     def _explore(self, c: FwComponent) -> _Block:
@@ -904,9 +1010,10 @@ class IrMapper:
                 raise NotParam(f"{what} is under a loop or branch on parameters")
         self._pre_arrays(sc)
         root = _Block()
-        # Objects, in creation order. Domain objects are not fields.
+        # Objects, in creation order. Domain, endpoint and configuration
+        # objects are not fields.
         for ch in c.children.values():
-            if not isinstance(ch, FwDomain):
+            if not isinstance(ch, (FwDomain, FwEndpoint, FwCfg)):
                 self._place_object(sc, root, ch)
         # Associations of children created under a branch on parameters: in
         # the child's arm.
@@ -953,7 +1060,7 @@ class IrMapper:
         ``base[<loop variable>]``."""
         c = sc.c
         for ch in c.children.values():
-            if isinstance(ch, FwDomain) or not ch.ctx or ch.ctx[-1][0].kind != "loop":
+            if isinstance(ch, (FwDomain, FwEndpoint, FwCfg)) or not ch.ctx or ch.ctx[-1][0].kind != "loop":
                 continue
             f, _k, v, _t = ch.ctx[-1]
             if ch.name_sym is None:
@@ -1411,6 +1518,86 @@ class IrMapper:
                 kind=self._domain_kind(kn), assoc=assoc, deriv=deriv, sources=sources,
                 params=params))
 
+    # -- protocols (protocol-kit-plan §8.11, the Z7 shapes) --------------
+    def _hubs(self) -> None:
+        """A ``DataTypeProtocolHub`` per family used, and a
+        ``DataTypeProtocol`` per API it carries, in ``type_m``."""
+        proto = getattr(self.rt, "proto", None)
+        if proto is None:
+            return
+        for fam in proto.families:
+            recs = [r for r in proto.recs.values() if r.family == fam]
+            if not recs or fam in self.ctxt.type_m:
+                continue
+            r = recs[0]
+            hub = ir.DataTypeProtocolHub(name=fam, template_params=[
+                ir.TemplateParamType(name=k, kind=ir.TemplateParamKind.TYPE)
+                if isinstance(v, str) else
+                ir.TemplateParamValue(name=k, kind=ir.TemplateParamKind.VALUE,
+                                      value_type=ir.DataTypeInt(bits=32, signed=True))
+                for k, v in r.params.items()])
+            for d in sorted(r.apis):
+                api = _base_name(r.apis[d].cls)
+                hub.apis.append(ir.ProtocolApi(
+                    api=api, dir=ir.ProtoDir.REQ if d == 0 else ir.ProtoDir.RSP))
+                if api not in self.ctxt.type_m:
+                    self.ctxt.type_m[api] = ir.DataTypeProtocol(name=api)
+            self.ctxt.type_m[fam] = hub
+
+    def _protocols(self, c: FwComponent, t: ir.DataTypeComponent,
+                   general: bool = False) -> None:
+        """The Z7 shapes of ``c``: its converter, its bundles' protocols,
+        its endpoints and configuration objects, and the API and
+        configuration connections made in its code. In a general type, an
+        endpoint or configuration object under a loop or branch on
+        parameters makes ``c`` a specialization."""
+        rt = self.rt
+        proto = getattr(rt, "proto", None)
+        if proto is not None:
+            for r in proto.recs.values():
+                e = next((x for x in r.converters if x["type"] == c.type_name), None)
+                if e is not None:
+                    t.converter = ir.ProtocolConverter(
+                        from_proto=_proto_ref(proto.recs[e["from"]]),
+                        to_proto=_proto_ref(proto.recs[e["to"]]), role=e.get("role", ""))
+                    break
+
+        def walk(o):
+            for ch in o.children.values():
+                if isinstance(ch, FwComponent):
+                    continue
+                yield ch
+                yield from walk(ch)
+        for ch in sorted(walk(c), key=lambda o: o.seq):
+            if ch.kind in BUNDLE_KINDS and ch.proto is not None:
+                t.bundle_protocols.append(ir.BundleProtocol(
+                    target=ch.rel_path(c), protocol=_proto_ref(ch.proto), role=ch.kind))
+            elif general and ch.ctx and isinstance(ch, (FwEndpoint, FwCfg)):
+                raise NotParam(f"{ch.path} is under a loop or branch on parameters")
+            elif isinstance(ch, FwEndpoint):
+                # port, export, socket; a socket's api is the OUT it calls.
+                kind = ch.api[3:]
+                a = ty.type_param(ch.cls, "OUT" if ch.sock else "API")
+                t.api_endpoints.append(ir.ApiEndpoint(
+                    name=".".join(ch.rel_path(c)), kind=kind,
+                    api=_base_name(a) if a is not None else None))
+            elif isinstance(ch, FwCfg):
+                dt = self._type(ty.type_param(ch.cls, "T"))
+                lst = t.cfg_publishers if ch.kind == CFG_PUB else t.cfg_consumers
+                cls = ir.CfgPublisher if ch.kind == CFG_PUB else ir.CfgConsumer
+                lst.append(cls(name=".".join(ch.rel_path(c)), cfg_type=dt))
+        for b in rt.binds:
+            if b.scope is not c:
+                continue
+            if b.kind == "api":
+                t.api_connections.append(ir.ApiConnection(
+                    kind="connect_up" if b.up else "connect",
+                    src=b.a.rel_path(c), dst=b.b.rel_path(c)))
+            elif b.kind == "cfg":
+                t.cfg_connections.append(ir.CfgConnection(
+                    publisher=b.a.rel_path(c), consumer=b.b.rel_path(c),
+                    derived=False))      # no derived cfg binding
+
     def _port_names(self) -> None:
         """Each kind's ``K::port_name(assoc, attr)`` for every association
         name of the kind and every attribute value its pins, drivers and
@@ -1467,6 +1654,21 @@ class IrMapper:
         self._sig[key] = name
         self.generic[name] = bool(getattr(t, "template_params", None))
         return name
+
+
+def _write_clock(t, b):
+    """The clock domain of step block ``b`` of ``t``: that of the first
+    signal it writes (or the signal's nearest parent) that ``t`` sets to a
+    clock domain, else the component's own (FW-E-STEP-DOMAINS checks that
+    a block's writes agree)."""
+    clocks = {tuple(a.target): a.domain for a in getattr(t, "domain_assocs", [])
+              if a.kind == "fw_clock_kind" and a.assoc == "" and a.target}
+    for p in b.writes:
+        for n in range(len(p), 0, -1):
+            d = clocks.get(tuple(p[:n]))
+            if d is not None:
+                return d
+    return ir.DomainRef(kind="fw_clock_kind", target=[])
 
 
 def _domain_refs(t):
@@ -1815,12 +2017,31 @@ def _key(t) -> list:
         out.append([[x.kind, x.assoc, x.port] for x in t.domain_port_names])
         out.append([[x.kind, x.assoc, x.deriv, [_dkey(y) for y in x.sources], _dmap(x.params)]
                     for x in t.domain_provides])
+        cv = t.converter
+        out.append(None if cv is None else
+                   [_ekey(cv.from_proto), _ekey(cv.to_proto), cv.role])
+        out.append([[_pkey(x.target), _ekey(x.protocol), x.role] for x in t.bundle_protocols])
+        out.append([[x.name, x.kind, x.api, _ekey(x.protocol), _pkey(x.imp)]
+                    for x in t.api_endpoints])
+        out.append([[x.kind, _pkey(x.src), _pkey(x.dst)] for x in t.api_connections])
+        out.append([[x.name, _ekey(x.cfg_type)] for x in t.cfg_publishers])
+        out.append([[x.name, _ekey(x.cfg_type)] for x in t.cfg_consumers])
+        out.append([[_pkey(x.publisher), _pkey(x.consumer), x.derived]
+                    for x in t.cfg_connections])
     if isinstance(t, ir.DataTypeExtern):
         out.append([t.extern_name, {k: _ekey(v) for k, v in t.extern_params.items()},
                     [[p.name, p.path, _ekey(p.tie), p.open, _ekey(p.datatype),
                       p.domain_kind, _dkey(p.domain), _dmap(p.domain_attr), p.output]
                      for p in t.pins]])
     return out
+
+
+def _proto_ref(rec) -> ir.ProtocolRef:
+    """A protocol record as a ``ProtocolRef``: its family and its params
+    by name (a type parameter as a ``DataTypeRef`` to its spelling)."""
+    return ir.ProtocolRef(family=rec.family, params={
+        k: ir.DataTypeRef(ref_name=v) if isinstance(v, str) else ir.ExprConstant(value=v)
+        for k, v in rec.params.items()})
 
 
 def _pkey(path) -> list:

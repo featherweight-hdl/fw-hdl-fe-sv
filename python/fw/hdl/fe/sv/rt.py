@@ -25,11 +25,21 @@ from zuspec.fe.sv.interp.values import Struct, Sym, const_to_py, norm, strip, un
 from . import types as ty
 from . import values as vx
 from .params import ParamArg
-from .objects import (BUNDLE, COMPONENT, MIRROR, MONITOR, Assoc, Conn, Diag, ExternRec,
-                      FwBundle, FwComponent, FwObject, FwSignal, PinRule, Tie)
+from .objects import (BUNDLE, CFG_CONS, CFG_PUB, COMPONENT, MIRROR, MONITOR, Assoc, Binding, Conn,
+                      Diag, ExternRec, FwBundle, FwCfg, FwComponent, FwEndpoint, FwObject, FwSignal,
+                      PinRule, Tie)
 
 _SIGNAL_DIR = {"fw_signal": None, "fw_input": "in", "fw_output": "out", "fw_inout": "inout"}
+_PROTO_API = {"fw_protocol_type_of", "fw_api_type_of", "fw_protocol_decl", "fw_protocol_family",
+              "fw_api_type", "fw_protocol_type", "fw_protocol"}
 _ROLE = {"fw_bundle": BUNDLE, "fw_mirror": MIRROR, "fw_monitor": MONITOR}
+# API endpoint classes: (port side, socket).
+_ENDPOINT = {"fw_socket": (True, True), "fw_port": (True, False), "fw_export": (False, False)}
+# Configured endpoints: (base endpoint class, "src" or "sink").
+_CFG_EP = {"fw_port_cfg_src": ("fw_port", "src"), "fw_port_cfg_sink": ("fw_port", "sink"),
+           "fw_export_cfg_src": ("fw_export", "src"), "fw_export_cfg_sink": ("fw_export", "sink"),
+           "fw_socket_cfg_src": ("fw_socket", "src"), "fw_socket_cfg_sink": ("fw_socket", "sink")}
+_CFG = {"fw_cfg_src": CFG_PUB, "fw_cfg_sink": CFG_CONS}
 
 
 class ElabError(Exception):
@@ -75,6 +85,11 @@ class FeRt:
         self.components: List[FwComponent] = []
         self.conns: List[Conn] = []
         self.ties: List[Tie] = []
+        self.binds: List[Binding] = []
+        # Configuration (rt-sv's __fw_rt_cfg): connect_up inner -> outer, and
+        # connect sink side -> source side, over plain and configured ones.
+        self.cfg_up: Dict[int, FwObject] = {}
+        self.cfg_src: Dict[int, FwObject] = {}
         self.overrides: List[Override] = []
         self.diags: List[Diag] = []
         self._by_sv: Dict[int, FwObject] = {}
@@ -96,6 +111,8 @@ class FeRt:
         self._force_on = False
         from .domains import Domains
         self.dom = Domains(self)
+        from .protocols import Protocols
+        self.proto = Protocols(self)
 
     # -- diagnostics ----------------------------------------------------
     def error(self, id: str, path: str, msg: str) -> None:
@@ -258,6 +275,7 @@ class FeRt:
             return sv
         self.components.append(c)
         c.is_extern = ty.implements(cls, "fw_extern_if")
+        self.proto.component_created(c)
         self._class_leaves(c, c.cls)
         self._resolve_params(c, p)
         self._run(c, lambda: self.interp.run_ctor(sv, cls))
@@ -304,6 +322,7 @@ class FeRt:
                      btype_name=ty.type_name(b), ctx=self.ctx(), name_sym=name_sym,
                      targs=targs)
         self._register(o)
+        self.proto.bundle_created(o)
         self._class_leaves(o, b)
         self._tstack.append(o)
         try:
@@ -312,6 +331,167 @@ class FeRt:
         finally:
             self._tstack.pop()
         return sv
+
+    # -- API endpoints and sockets (protocols.md) ------------------------
+    def create_endpoint(self, cls, api: str, name, sv_parent) -> Any:
+        name = vx.to_str(name)
+        parent = self._parent(unwrap(sv_parent), name)
+        if parent is None:
+            raise ElabError(f"endpoint {name!r} has no parent")
+        base, role = _CFG_EP.get(api, (api, ""))
+        out, sock = _ENDPOINT[base]
+        sv = self.interp.allocate(cls)
+        e = FwEndpoint(name=name, parent=parent, sv=sv, cls=ty.canon(cls),
+                       type_name=ty.type_name(cls), ctx=self.ctx(), out=out, sock=sock,
+                       must=out, api=base, cfg=role,
+                       tkey=ty.type_name(ty.type_param(cls, "CFG")) if role else "")
+        self._register(e)
+        return sv
+
+    def link(self, a_sv, b_sv, up: bool) -> None:
+        """``connect`` (up False) or ``connect_up``: binds ``a`` to ``b``;
+        a configured endpoint's also records the cfg binding."""
+        a, b = self._link(a_sv, b_sv, up)
+        if a is not None and a.cfg:
+            self.bind_cfg(a, b, up, self.binds[-1].scope)
+
+    def _link(self, a_sv, b_sv, up: bool):
+        a = self._used(unwrap(a_sv), "an endpoint")
+        b = self._used(unwrap(b_sv), "an endpoint")
+        if a is None or b is None:
+            raise ElabError("connect: an endpoint is null")
+        scope = self._conn_scope("connect_up" if up else "connect", a.path)
+        if scope is None:
+            return None, None
+        from .resolve import _in_scope
+        for o in (a, b):
+            if not _in_scope(o, scope):
+                self.error("FW-E-CONN-SCOPE", o.path, f"not in the scope of {scope.path}")
+                return None, None
+        for x in ((a, b) if a.sock and not up else (a,)):
+            if x.up is not None or x.peer is not None:
+                self.error("FW-E-SOCK-MULTI", x.path,
+                           f"already bound to {(x.up or x.peer).path}")
+                return None, None
+        if a.sock and not up:
+            a.peer, b.peer = b, a           # socket to peer socket: both ways
+        else:
+            a.up = b
+        self.binds.append(Binding("api", a, b, scope, up))
+        return a, b
+
+    def check_api(self) -> None:
+        """FW-E-SOCK-UNBOUND: a port that reaches no export; a socket the
+        outermost socket of whose connect_up chain has no peer."""
+        for e in sorted((o for o in self._by_sv.values() if isinstance(o, FwEndpoint)),
+                        key=lambda o: o.seq):
+            if not e.must:
+                continue
+            x, n = e, 0
+            if e.sock:
+                while x.peer is None and x.up is not None and n < len(self._by_sv):
+                    x, n = x.up, n + 1
+                if x.peer is not None:
+                    continue
+            else:
+                while x is not None and x.out and n < len(self._by_sv):
+                    x, n = x.up, n + 1
+                if x is not None and not x.out:
+                    continue
+            self.error("FW-E-SOCK-UNBOUND", e.path, "resolves to no export")
+
+    # -- configuration (protocols.md, "Configuration") --------------------
+    def create_cfg(self, cls, api: str, name, sv_parent) -> Any:
+        name = vx.to_str(name)
+        parent = self._parent(unwrap(sv_parent), name)
+        if parent is None:
+            raise ElabError(f"configuration {name!r} has no parent")
+        sv = self.interp.allocate(cls)
+        o = FwCfg(name=name, parent=parent, sv=sv, cls=ty.canon(cls), kind=_CFG[api],
+                  type_name=ty.type_name(cls), ctx=self.ctx(),
+                  tkey=ty.type_name(ty.type_param(cls, "T")))
+        self._register(o)
+        return sv
+
+    def cfg_set(self, p_sv, v) -> None:
+        p = self._used(unwrap(p_sv), "a cfg source")
+        p.value = strip(v)
+
+    def cfg_get(self, p_sv) -> Any:
+        p = self._used(unwrap(p_sv), "a cfg source")
+        if p.value is None:
+            raise ElabError(f"{p.path}: get() before set()")
+        return p.value
+
+    @staticmethod
+    def _is_src(o) -> bool:
+        return o.kind == CFG_PUB if isinstance(o, FwCfg) else o.cfg == "src"
+
+    def cfg_link(self, a_sv, b_sv, up: bool) -> None:
+        """A plain sink's or source's ``a.connect(b)`` (up False) or
+        ``a.connect_up(b)``."""
+        a = self._used(unwrap(a_sv), "a cfg endpoint")
+        b = self._used(unwrap(b_sv), "a cfg endpoint")
+        if a is None or b is None:
+            raise ElabError("connect: a configuration endpoint is null")
+        scope = self._conn_scope("connect_up" if up else "connect", a.path)
+        if scope is None:
+            return
+        from .resolve import _in_scope
+        for o in (a, b):
+            if not _in_scope(o, scope):
+                self.error("FW-E-CONN-SCOPE", o.path, f"not in the scope of {scope.path}")
+                return
+        self.bind_cfg(a, b, up, scope)
+
+    def bind_cfg(self, a, b, up: bool, scope) -> None:
+        """Records a checked cfg connection and its "cfg" binding, source to
+        sink (rt-sv's ``__fw_rt_cfg::bind_cfg``)."""
+        if up:
+            self.cfg_up[id(a)] = b
+            p, s = (a, b) if self._is_src(a) else (b, a)
+        else:
+            p, s = (a, b) if self._is_src(a) else (b, a)
+            if id(s) in self.cfg_src:
+                self.error("FW-E-SOCK-MULTI", s.path,
+                           f"already configured by {self.cfg_src[id(s)].path}")
+                return
+            self.cfg_src[id(s)] = p
+        self.binds.append(Binding("cfg", p, s, scope, up))
+
+    def check_cfg(self) -> None:
+        """Binds each sink to its source (rt-sv's ``__fw_rt_cfg::resolve``):
+        out along its connect_up chain to a connect, then in along the
+        source's connect_up chain to the innermost source. FW-E-CFG-UNBOUND
+        on an innermost sink no source reaches. Then the static
+        FW-E-CFG-WRITE check."""
+        objs = sorted(self._by_sv.values(), key=lambda o: o.seq)
+        sinks = [o for o in objs if (isinstance(o, FwCfg) and o.kind == CFG_CONS)
+                 or (isinstance(o, FwEndpoint) and o.cfg == "sink")]
+        outer = {id(self.cfg_up[id(c)]) for c in sinks if id(c) in self.cfg_up}
+        inner: Dict[int, FwObject] = {}       # source connect_up: outer -> inner
+        for o in objs:
+            if self._is_cfg(o) and self._is_src(o) and id(o) in self.cfg_up:
+                inner.setdefault(id(self.cfg_up[id(o)]), o)
+        n = len(objs)
+        for c in sinks:
+            x, k = c, 0
+            while id(x) not in self.cfg_src and id(x) in self.cfg_up and k < n:
+                x, k = self.cfg_up[id(x)], k + 1
+            if id(x) not in self.cfg_src:
+                if id(c) not in outer:
+                    self.error("FW-E-CFG-UNBOUND", c.path, "no source reaches this sink")
+                continue
+            s = self.cfg_src[id(x)]
+            while id(s) in inner and k < n:
+                s, k = inner[id(s)], k + 1
+            c.src = s
+        from .cfgcheck import check_writes
+        check_writes(self)
+
+    @staticmethod
+    def _is_cfg(o) -> bool:
+        return isinstance(o, FwCfg) or (isinstance(o, FwEndpoint) and bool(o.cfg))
 
     # -- params (§3.9) ---------------------------------------------------
     def _resolve_params(self, c: FwComponent, p) -> None:
@@ -737,6 +917,28 @@ class FeIntrinsics(Intrinsics):
                 return rt.connect(this, a[0], "connect", this_sym)
             if name == "tie":
                 return rt.tie(this, a[0], this_sym)
+        elif api in _ENDPOINT or api in _CFG_EP:
+            if name == "create":
+                return rt.create_endpoint(owner, api, a[0], a[1])
+            if name in ("connect", "connect_up"):
+                return rt.link(this, a[0], name == "connect_up")
+            if name in ("set_imp", "add_listener"):
+                return None
+            if name == "set" and api in _CFG_EP:
+                return rt.cfg_set(this, a[0])
+            if name == "get" and api in _CFG_EP:
+                return rt.cfg_get(this)
+        elif api in _CFG:
+            if name == "create":
+                return rt.create_cfg(owner, api, a[0], a[1])
+            if name == "set":
+                return rt.cfg_set(this, a[0])
+            if name == "get":
+                return rt.cfg_get(this)
+            if name in ("connect", "connect_up"):
+                return rt.cfg_link(this, a[0], name == "connect_up")
+            if name == "add_listener":
+                return None
         elif api in _ROLE:
             if name == "create":
                 return rt.create_bundle(owner, api, a[0], a[1])
@@ -808,6 +1010,10 @@ class FeIntrinsics(Intrinsics):
                 return rt.dom.handle(owner)
             if name == "name":
                 return rt.dom.handle_name(this)
+        elif api in _PROTO_API:
+            r = self._protocol(owner, this, api, name, a)
+            if r is not NOT_HANDLED:
+                return r
         if (api, name) in rt.extern_methods:
             raise ElabError(f"fe-sv does not implement {api}::{name}")
         return NOT_HANDLED        # written in SV in the API itself (fw_rv_if::build)
@@ -835,6 +1041,34 @@ class FeIntrinsics(Intrinsics):
             return d.drive(owner, sub, this, a[0], a[1])
         if name == "params":
             return d.params(this)
+        return NOT_HANDLED
+
+    def _protocol(self, owner, this, api, name, a):
+        """The protocol classes' functions (protocols.py)."""
+        p = self.rt.proto
+        if api == "fw_protocol_type_of" and name == "get":
+            return p.protocol_get(owner, a[0])
+        if api == "fw_api_type_of" and name == "get":
+            return p.api_get(owner)
+        if api == "fw_protocol_decl":
+            if name == "api":
+                return p.decl_api(this, a[0], a[1])
+            if name == "prefix":
+                return p.decl_prefix(this, a[0])
+        if api == "fw_protocol_family":
+            return p.family_query(this, name)
+        if api in ("fw_api_type", "fw_api_type_of") and name in ("name", "family", "protocols"):
+            return p.api_query(this, name)
+        if api in ("fw_protocol_type", "fw_protocol_type_of") and name != "get":
+            r = p.protocol_query(this, name, a)
+            return NOT_HANDLED if name in ("xtors", "abstractors") else r
+        if api == "fw_protocol":
+            if name == "declare":
+                return None           # the default: no APIs
+            if name == "of":
+                return p.of(a[0])
+            if name == "role_of":
+                return p.role_of(a[0])
         return NOT_HANDLED
 
     def call(self, interp, sub, this, args, named=None):

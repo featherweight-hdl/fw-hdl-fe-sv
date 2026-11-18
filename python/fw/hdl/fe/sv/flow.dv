@@ -13,8 +13,14 @@ package:
   - name: Elaborate
     scope: export
     desc: Elaborate an fw-hdl design to Zuspec IR and an elaborated netlist
+    doc: |
+      Takes ``fwHdlSource`` (and extern RTL) directly, or from a ``Scan``
+      upstream, which passes them on with its ``fwHdlScan`` FileSet. The
+      sources are compiled again either way; the scan is checked against
+      the elaborated ``protocols`` (FW-E-SCAN-STALE where they differ).
     consumes:
     - filetype: fwHdlSource
+    - filetype: fwHdlScan
     - filetype: systemVerilogSource
     - filetype: verilogSource
     passthrough: none
@@ -44,6 +50,54 @@ package:
         value: {}
     shell: pytask
     run: fw.hdl.fe.sv.dfm.Elaborate
+
+  - name: Scan
+    scope: export
+    desc: Find the protocols, bundles and converters of fw-hdl sources, with no top
+    doc: |
+      Writes ``scan.json`` (the netlist-form ``protocols`` table, the
+      classes visited) and ``scan.zir`` (Zuspec IR: each protocol's API
+      interface classes and the types they use), as a ``fwHdlScan``
+      FileSet. The ``fwHdlSource`` and RTL inputs are passed on.
+    consumes:
+    - filetype: fwHdlSource
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    passthrough: none
+    with:
+      spec:
+        doc: The fw-hdl-spec checkout (default $FW_HDL_SPEC, else $IVPM_PACKAGES/fw-hdl-spec)
+        type: str
+        value: ""
+    shell: pytask
+    run: fw.hdl.fe.sv.dfm.Scan
+
+  - name: GenKit
+    scope: export
+    desc: Generate a protocol kit's derived classes (proxies, listeners, txns, ...) as one SV package
+    doc: |
+      Scans the kit's ``fwHdlSource`` and writes ``<core pkg>_gen_pkg.sv``
+      (``fw.hdl.gen.gen_kit``), a ``systemVerilogSource`` FileSet that
+      imports ``fw_hdl_pkg`` and the core package. The ``fwHdlSource`` and
+      RTL inputs are passed on. The task re-runs when the generators
+      change, as well as when its inputs do.
+    consumes:
+    - filetype: fwHdlSource
+    - filetype: systemVerilogSource
+    - filetype: verilogSource
+    passthrough: none
+    with:
+      spec:
+        doc: The fw-hdl-spec checkout (default $FW_HDL_SPEC, else $IVPM_PACKAGES/fw-hdl-spec)
+        type: str
+        value: ""
+      pkg_name:
+        doc: The generated package's name (default ``<core pkg>_gen_pkg``)
+        type: str
+        value: ""
+    shell: pytask
+    run: fw.hdl.fe.sv.dfm.GenKit
+    uptodate: fw.hdl.fe.sv.dfm.GenKitUpToDate
 
   - name: EmitSV
     scope: export
