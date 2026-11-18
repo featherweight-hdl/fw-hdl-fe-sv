@@ -46,6 +46,26 @@ def type_name(t, aliases: bool = False) -> str:
     return str(t).replace(" ", "")
 
 
+def qual_type_name(t) -> str:
+    """A type's spelling for SV outside its package: a typedef (the first
+    one reached that is not a type parameter's alias) by its qualified name,
+    ``sbus_pkg::sbus_req_t``; any other type as :func:`type_name`."""
+    while getattr(t, "isAlias", False):
+        if not _type_param_alias(t):
+            lp = str(getattr(t, "lexicalPath", "") or "")
+            return lp if "::" in lp else t.name
+        t = t.targetType.type
+    return type_name(t)
+
+
+def package_of(sym) -> Optional[str]:
+    """The package a class, its specialization or a typedef is declared
+    in, from its lexical path; None if not in a package."""
+    s = getattr(sym, "genericClass", None) or sym
+    lp = str(getattr(s, "lexicalPath", "") or "")
+    return lp.split("::", 1)[0] if "::" in lp else None
+
+
 def _type_param_alias(t) -> bool:
     """A type parameter's alias (``T`` in ``fw_put_if #(T)``): spelled by
     its value, not its name."""

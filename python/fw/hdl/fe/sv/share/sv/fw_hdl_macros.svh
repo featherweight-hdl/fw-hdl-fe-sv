@@ -59,11 +59,16 @@
     endfunction
 
 // fe-sv reads the __fw_ members below to register transactors,
-// abstractors and bundle protocols.
+// abstractors and bundle protocols. __fw_ctor names the class's
+// fw_ctor_of, so the abstractors() and abstractor_for queries can return
+// one for a class the design names but never creates.
 `define fw_xtor_utils(C, PROTO) \
     `fw_component_utils(C) \
     static function fw_protocol_type __fw_xtor_protocol(); \
         return PROTO::get_type(); \
+    endfunction \
+    static function fw_ctor #(fw_component) __fw_ctor(); \
+        return fw_ctor_of #(fw_component, C)::get(); \
     endfunction
 
 `define fw_xtor_param_utils(C, PROTO) \
@@ -76,6 +81,9 @@
     endfunction \
     static function fw_protocol_type __fw_abs_to(); \
         return TO::get_type(); \
+    endfunction \
+    static function fw_ctor #(fw_component) __fw_ctor(); \
+        return fw_ctor_of #(fw_component, C)::get(); \
     endfunction
 
 `define fw_abstractor_param_utils(C, FROM, TO) \

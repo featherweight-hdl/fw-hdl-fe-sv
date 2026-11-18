@@ -52,11 +52,13 @@ def arg_refs(fn: ir.Function) -> List[ir.Expr]:
 
 
 def zero(dt: Optional[ir.DataType]) -> ir.Expr:
-    """The default (zero) value of ``dt``: ``null`` for a class handle, ``0``
-    otherwise. Guess: a struct or unpacked-array payload needs a fill
-    (``'{default: '0}``) be-sv cannot express yet (gap G4)."""
+    """The default (zero) value of ``dt``: ``null`` for a class handle,
+    ``'{default: 0}`` for a struct, ``0`` otherwise (a packed struct is
+    integral, but the fill is right for both)."""
     if isinstance(dt, (ir.DataTypeClass, ir.DataTypeProtocol)):
         return ir.ExprNull()
+    if isinstance(dt, ir.DataTypeStruct):
+        return ir.ExprStructLiteral(default=ir.ExprConstant(value=0))
     return ir.ExprConstant(value=0)
 
 
@@ -109,6 +111,14 @@ def arg(name: str, dt: ir.DataType, direction=None) -> ir.Arg:
 
 def eq(a: ir.Expr, b: ir.Expr) -> ir.Expr:
     return ir.ExprCompare(left=a, ops=[ir.CmpOp.Eq], comparators=[b])
+
+
+def ne(a: ir.Expr, b: ir.Expr, dt: Optional[ir.DataType] = None) -> ir.Expr:
+    """``a !== b``: an X or Z bit in a 4-state value counts as a difference
+    (``!=`` would give X, which an ``if`` takes as false). A string, which
+    has no case equality in SV, gets ``!=``."""
+    op = ir.CmpOp.NotEq if isinstance(dt, ir.DataTypeString) else ir.CmpOp.CaseNotEq
+    return ir.ExprCompare(left=a, ops=[op], comparators=[b])
 
 
 def index(value: ir.Expr, i: ir.Expr) -> ir.Expr:

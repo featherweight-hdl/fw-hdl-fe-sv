@@ -15,23 +15,34 @@ registry, like rt-sv's ``bundles()``, holds what the design instantiates.
 
 A transactor's role is derived from its pin member (:func:`xtor_role`).
 
-The queries that return constructors (``xtors``, ``abstractors``,
-``abstractor_for``) are not implemented: fe-sv cannot make
-an ``fw_ctor_of #(fw_component, C)`` for a class it did not see named.
+:func:`walk_port` is the one walk over a port's bundle tree (pins with
+their directions, the outermost protocol levels) that the testbench
+generators (``fw.hdl.gen.tb``, ``.bind``) share.
+
+The queries that return constructors (``abstractors``,
+``abstractor_for``) answer from the converter classes the design names
+(protocols.md, "Completeness"), not only those it creates: the first such
+query registers every converter class a scan of the compiled packages
+visits (:func:`scan.register_named`). The constructor is the class's
+``__fw_ctor()`` (fe-sv's macros), an ``fw_ctor_of #(fw_component, C)``
+served by ``FeRt.ctor_get``.
 
 ``FW-E-PROTO-THIS`` is fe-sv's own check (a ``_param_utils`` class whose
 ``this_t`` is not its own specialization compiles in SV).
+``FW-E-PROTO-XTOR`` (a converter that does not connect what it registers
+for) is checked on the class when it registers (rt-sv checks each created
+converter's children).
 """
 from __future__ import annotations
 
 import dataclasses as dc
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from zuspec.fe.sv.interp.values import const_to_py, unwrap
 
 from . import types as ty
 from . import values as vx
-from .objects import BUNDLE, MIRROR, MONITOR, FwBundle, FwComponent
+from .objects import BUNDLE, MIRROR, MONITOR, FwBundle, FwComponent, FwSignal
 
 DIRS = ("req", "rsp")                                   # fw_proto_dir_e
 ROLES = ("initiator", "target", "monitor")              # fw_proto_role_e
@@ -39,11 +50,12 @@ _KIND_ROLE = {BUNDLE: 0, MIRROR: 1, MONITOR: 2}
 _PIN_ROLE = {"fw_mirror": 1, "fw_monitor": 2, "fw_bundle": 0}
 
 
-def xtor_role(cls) -> int:
-    """A transactor's role (fw_proto_role_e), from the API pin class of its
-    first such member (class chain, most derived first): ``fw_mirror`` ->
-    target, ``fw_monitor`` -> monitor, ``fw_bundle`` -> initiator (as rt-sv's
-    ``__fw_rt_proto::xtor_role``). Initiator when it has none."""
+def xtor_pins(cls) -> Tuple[int, Optional[str]]:
+    """A transactor's role (fw_proto_role_e) and the name of its pin member:
+    the first member (class chain, most derived first) whose type is an
+    API pin class. ``fw_mirror`` -> target, ``fw_monitor`` -> monitor,
+    ``fw_bundle`` -> initiator (as rt-sv's ``__fw_rt_proto::xtor_role``).
+    ``(initiator, None)`` when it has none."""
     for c in ty.class_chain(cls):
         for m in c:
             if type(m).__name__ != "ClassPropertySymbol" or getattr(m, "isStatic", False):
@@ -53,8 +65,91 @@ def xtor_role(cls) -> int:
                 continue
             n = ty.api_base(t, _PIN_ROLE)
             if n is not None:
-                return _PIN_ROLE[n]
-    return 0
+                return _PIN_ROLE[n], m.name
+    return 0, None
+
+
+def xtor_role(cls) -> int:
+    """A transactor's role (fw_proto_role_e), from its pin member
+    (:func:`xtor_pins`). Initiator when it has none."""
+    return xtor_pins(cls)[0]
+
+
+# -- the bundle tree of a port (F10) -------------------------------------------
+
+#: the mixin seen through one more ``fw_mirror``
+_FLIP_KIND = {BUNDLE: MIRROR, MIRROR: BUNDLE, MONITOR: MONITOR}
+
+
+@dc.dataclass(eq=False)
+class PortPin:
+    """One leaf signal of a port, as its owner sees it."""
+    sig: FwSignal
+    path: List[str]             # member path from the owner: ["s", "req", "valid"]
+    rel: List[str]              # member path within the port: ["req", "valid"]
+    dir: str                    # "in", "out" or "inout", for the port's owner
+
+    @property
+    def name(self) -> str:
+        """The pin's name: the member path joined with ``_`` (the emitter's)."""
+        return "_".join(self.path)
+
+
+@dc.dataclass(eq=False)
+class ProtoLevel:
+    """A level of a port's bundle tree that carries a protocol."""
+    bundle: FwBundle
+    rel: List[str]              # member path within the port ([] for the port)
+    kind: str                   # its mixin as the owner sees it (bundle, mirror, monitor)
+    proto: Any                  # ProtoRec
+
+
+@dc.dataclass(eq=False)
+class PortWalk:
+    """A port's bundle tree, walked once (:func:`walk_port`)."""
+    port: FwBundle
+    path: List[str]             # member path from the owner: ["s"]
+    #: the outermost levels that carry a protocol: the port alone when it
+    #: has one; else, per branch, the first bundle down that has one.
+    levels: List[ProtoLevel]
+    pins: List[PortPin]         # every leaf signal, in declaration order
+
+    @property
+    def name(self) -> str:
+        return "_".join(self.path)
+
+
+def walk_port(port: FwBundle, owner: Any = None) -> PortWalk:
+    """Walk the bundle tree of ``port`` (a bundle, mirror or monitor of
+    ``owner``, by default its parent): per leaf signal its member path and
+    its direction for the owner (reversed at each ``fw_mirror`` on the path,
+    the port included; an input under a monitor); and the outermost levels
+    that carry a protocol, each with its mixin as the owner sees it. The one
+    query gen_tb and gen_bind build a port's transactors and bridges from."""
+    owner = owner if owner is not None else port.parent
+    base = port.rel_path(owner)
+    levels: List[ProtoLevel] = []
+    pins: List[PortPin] = []
+
+    def visit(b: FwBundle, rel: List[str], kind: str, found: bool) -> None:
+        if not found and b.proto is not None:
+            levels.append(ProtoLevel(b, rel, kind, b.proto))
+            found = True
+        for c in b.children.values():
+            if isinstance(c, FwBundle):
+                k = MONITOR if MONITOR in (kind, c.kind) else \
+                    (_FLIP_KIND[kind] if c.kind == MIRROR else kind)
+                visit(c, rel + [c.name], k, found)
+            elif isinstance(c, FwSignal) and c.dir is not None:
+                d = c.dir
+                if kind == MONITOR:
+                    d = "in"
+                elif kind == MIRROR and d != "inout":
+                    d = "in" if d == "out" else "out"
+                pins.append(PortPin(c, base + rel + [c.name], rel + [c.name], d))
+
+    visit(port, [], port.kind, False)
+    return PortWalk(port, base, levels, pins)
 
 
 @dc.dataclass(eq=False)
@@ -98,6 +193,8 @@ class Protocols:
         self._by_h: Dict[int, Any] = {}           # id(handle object) -> its record
         self._decl: Dict[int, ProtoRec] = {}      # id(fw_protocol_decl object) -> record
         self._conv_done: Dict[str, Any] = {}    # converter class -> its protocol (xtor)
+        self._conv_cls: Dict[str, Any] = {}     # converter type name -> its class
+        self._named = False                     # register_named() has run
         self._this_checked: set = set()
 
     # -- handles ------------------------------------------------------------
@@ -211,18 +308,78 @@ class Protocols:
             role = xtor_role(cls)
             if rec is not None:
                 self._conv_done[type_name] = rec
+                self._conv_cls[type_name] = cls
                 rec.conv_cls.append((role, cls))
                 rec.converters.append({"type": type_name, "from": rec.name,
                                        "to": rec.name, "role": ROLES[role]})
+                self._check_sides(cls, [rec], api=(role != 2), bundle=True)
         elif ty.find_member(cls, "__fw_abs_from")[0]:
             f = self.rec_of(self._static(cls, "__fw_abs_from"))
             t = self.rec_of(self._static(cls, "__fw_abs_to"))
             if f is not None and t is not None:
+                self._conv_cls[type_name] = cls
                 e = {"type": type_name, "from": f.name, "to": t.name}
                 for r in {id(f): f, id(t): t}.values():
                     r.conv_cls.append((None, cls))
                     r.converters.append(e)
+                self._check_sides(cls, [f, t])
         return self._conv_done[type_name]
+
+    # -- FW-E-PROTO-XTOR ----------------------------------------------------
+    def _check_sides(self, cls, recs, api: bool = True, bundle: bool = True) -> None:
+        """A converter must connect what it registers for (protocols.md,
+        "Converters"): a transactor a bundle port of its protocol and (but
+        a monitor) an endpoint of one of its APIs or of its channel APIs;
+        an abstractor an endpoint or bundle port of each side. Checked on
+        the class's members (base classes included), once per class."""
+        bundles, apis = self._conv_members(cls)
+
+        def api_of(r):
+            # Its registered APIs, and the channel APIs derived from its
+            # bundles of channels (``<p>_req_if``, ``<p>_rsp_if``).
+            pre = self.family(r.family).prefix
+            return {ty.type_name(a.cls) for a in r.apis.values()} | \
+                {pre + "_req_if", pre + "_rsp_if"}
+        missing = []
+        for r in recs:
+            has_b, has_a = r.name in bundles, bool(api_of(r) & apis)
+            if len(recs) == 1:              # a transactor
+                if bundle and not has_b:
+                    missing.append(f"a bundle port of {r.name}")
+                if api and not has_a:
+                    missing.append(f"an endpoint of an API of {r.name}")
+            elif not (has_b or has_a):
+                missing.append(f"an endpoint or bundle port of {r.name}")
+        if missing:
+            cls = ty.canon(cls)
+            g = getattr(cls, "genericClass", None)
+            fam = g.name if g is not None else cls.name
+            self.rt.error("FW-E-PROTO-XTOR", fam, f"{fam}: missing {' and '.join(missing)}")
+
+    def _conv_members(self, cls):
+        """The protocols of a class's bundle ports and the API types of its
+        endpoints (canonical spellings)."""
+        bundles, apis = set(), set()
+        for c in ty.class_chain(cls):
+            for m in c:
+                if type(m).__name__ != "ClassPropertySymbol" or getattr(m, "isStatic", False):
+                    continue
+                t = ty.canon(m.type)
+                if not getattr(t, "isClass", False):
+                    continue
+                if ty.api_base(t, _PIN_ROLE) is not None:
+                    b = ty.type_param(t, "B")
+                    if b is not None and ty.find_member(b, "__fw_bundle_protocol")[0]:
+                        r = self.rec_of(self._static(b, "__fw_bundle_protocol"))
+                        if r is not None:
+                            bundles.add(r.name)
+                elif ty.api_base(t, ("fw_port", "fw_export", "fw_socket")) is not None:
+                    for pn in ("API", "OUT", "IN"):
+                        a = ty.type_param(t, pn)
+                        if a is not None:
+                            g = getattr(a, "genericClass", None)
+                            apis.update((ty.type_name(a), g.name if g is not None else getattr(a, "name", "")))
+        return bundles, apis
 
     # -- FW-E-PROTO-THIS ----------------------------------------------------
     def check_this(self, cls, family: Optional[str] = None) -> None:
@@ -280,6 +437,38 @@ class Protocols:
             return [rec.apis[d].handle for d in sorted(rec.apis)]
         if name == "bundles":
             return list(rec.bundles)
+        return None
+
+    def _named_convs(self) -> None:
+        if not self._named:
+            self._named = True
+            from .scan import register_named
+            register_named(self.rt)
+
+    def _ctor(self, type_name: str) -> Any:
+        cls = self._conv_cls[type_name]
+        if not ty.find_member(cls, "__fw_ctor")[0]:
+            from .rt import ElabError
+            raise ElabError(f"{type_name} has no __fw_ctor (not fe-sv's macros)")
+        return self._static(cls, "__fw_ctor")
+
+    def abstractors(self, this) -> List[Any]:
+        """``p.abstractors()``: constructors of the abstractors with ``p``
+        on either side, in registration order."""
+        self._named_convs()
+        rec = self.rec_of(this)
+        return [self._ctor(e["type"]) for e in rec.converters if "role" not in e]
+
+    def abstractor_for(self, f, t) -> Any:
+        """``fw_protocol::abstractor_for(from, to)``: a constructor of an
+        abstractor between the two, in either direction; None if none."""
+        self._named_convs()
+        a, b = self.rec_of(f), self.rec_of(t)
+        if a is None or b is None:
+            return None
+        for e in a.converters:
+            if "role" not in e and {e["from"], e["to"]} == {a.name, b.name}:
+                return self._ctor(e["type"])
         return None
 
     def of(self, x) -> Any:

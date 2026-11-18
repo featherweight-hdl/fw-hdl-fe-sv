@@ -24,6 +24,18 @@ returns the text of one file with
   lasts ``+fw_edges=N`` clock edges (default 100); diagnostics print as
   ``D <id> <path>``.
 
+Each protocol port is walked once (``protocols.walk_port``, shared with
+``gen_bind``): a bundle may hold bundles (a bundle of channels). The
+transactor and monitor are those of the outermost level carrying a
+protocol, of the opposite role; with none in the scan, ``FW-E-TB-XTOR``
+(``FW-E-TB-MON``) names the protocol, the role and the port, and the inner
+channels' transactors are never used instead. Every leaf signal gets one
+bridge, in its direction for the DUT (reversed at each ``fw_mirror`` on its
+path). The class package imports the packages of the level's bundle class,
+the transactors and the payload types; the module qualifies payload types
+(``sbus_pkg::sbus_req_t``). A transactor's pins are its pin member
+(``protocols.xtor_pins``: ``pins``, std's monitor ``p``).
+
 The DUT's clock and reset ports are the drivers of its clock and reset
 domains (IR ``domain_drivers``); one clock and at most one reset are
 supported. Other plain DUT inputs are tied to 0. Port names follow the
@@ -31,10 +43,10 @@ emitter's: the member path joined with ``_``.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fw.hdl.fe.sv.objects import FwBundle, FwSignal
-from fw.hdl.fe.sv.protocols import ROLES, xtor_role
+from fw.hdl.fe.sv.protocols import ROLES, PortWalk, ProtoLevel, walk_port, xtor_pins, xtor_role
 from fw.hdl.fe.sv import types as ty
 
 from .kit import GenError
@@ -58,17 +70,19 @@ def _generics(scan):
     return out
 
 
-def _find_xtor(scan, b: FwBundle, kind: Optional[str] = None) -> Optional[str]:
-    """The transactor for DUT bundle ``b``: the scan's lookup when it saw a
-    specialization; else a generic class of the scanned packages whose
-    default specialization is a transactor of ``b``'s protocol family and
-    the opposite role, specialized with the protocol's parameters (a guess:
-    a transactor takes its protocol's parameters, in order). ``kind``
-    ``"monitor"`` looks up a monitor of ``b``'s protocol instead."""
-    kind = kind or b.kind
+def _find_xtor(scan, lvl: ProtoLevel, kind: Optional[str] = None) -> Optional[Tuple[str, Any]]:
+    """The transactor for protocol level ``lvl`` of a DUT port, and its
+    class: the scan's lookup when it saw a specialization; else a generic
+    class of the scanned packages whose default specialization is a
+    transactor of the level's protocol family and the opposite role,
+    specialized with the protocol's parameters (a guess: a transactor takes
+    its protocol's parameters, in order). ``kind`` ``"monitor"`` looks up a
+    monitor of the protocol instead."""
+    kind = kind or lvl.kind
+    b = lvl.bundle
     x = scan.xtor_for(b.btype_name, kind)
     if x is not None:
-        return x
+        return x, scan.xtor_class(x)
     want = {"mirror": "initiator", "bundle": "target", "monitor": "monitor"}[kind]
     proto = scan.rt.proto
     for name, (_, g, scope) in _generics(scan).items():
@@ -83,20 +97,61 @@ def _find_xtor(scan, b: FwBundle, kind: Optional[str] = None) -> Optional[str]:
             rec = proto.rec_of(proto._static(spec, "__fw_xtor_protocol"))
         except Exception:       # pragma: no cover - a class the interpreter rejects
             continue
-        if rec is not None and rec.family == b.proto.family and \
+        if rec is not None and rec.family == lvl.proto.family and \
                 ROLES[xtor_role(spec)] == want:
-            return f"{name}#({','.join(b.proto.params.values())})"
+            return f"{name}#({','.join(lvl.proto.params.values())})", spec
     return None
 
 
-def _ports(r) -> Tuple[List[FwSignal], List[FwBundle]]:
-    sigs, bundles = [], []
+def _xtor_of(scan, w: PortWalk, kind: Optional[str] = None) -> Tuple[str, str, Any]:
+    """The transactor (``kind`` ``"monitor"``: the monitor) of DUT port
+    ``w``: at its outermost protocol level, of the opposite role. Returns
+    ``(type, pin member, class)``; a GenError names the protocol, the role
+    and the port when the scan has none. Never the inner channels'."""
+    lvl = w.levels[0]
+    k = kind or lvl.kind
+    role = {"mirror": "initiator", "bundle": "target", "monitor": "monitor"}[k]
+    found = _find_xtor(scan, lvl, k)
+    if found is None:
+        code = "FW-E-TB-MON" if k == "monitor" else "FW-E-TB-XTOR"
+        raise GenError(code, f"{w.port.path}: protocol {lvl.proto.name} has no {role} "
+                       f"{'monitor' if k == 'monitor' else 'transactor'} in the scan "
+                       f"(port {w.name}, a {w.port.kind} of {lvl.bundle.btype_name})")
+    x, cls = found
+    pins = xtor_pins(cls)[1] if cls is not None else None
+    return x, pins or "pins", cls
+
+
+def _ports(r) -> Tuple[List[FwSignal], List[PortWalk]]:
+    """The DUT's plain ports, and the walk of each protocol port."""
+    sigs, ports = [], []
     for ch in sorted(r.top.children.values(), key=lambda o: o.seq):
-        if isinstance(ch, FwBundle) and ch.kind in _TB_MIXIN and ch.proto is not None:
-            bundles.append(ch)
+        if isinstance(ch, FwBundle) and ch.kind in _TB_MIXIN:
+            w = walk_port(ch, r.top)
+            if ch.proto is not None:
+                ports.append(w)
+            elif w.levels:
+                # a port is one protocol: a bundle without one that groups
+                # protocol bundles is not a port gen_tb drives
+                inner = ", ".join(f"{'.'.join(l.rel)} ({l.proto.name})" for l in w.levels)
+                raise GenError("FW-E-TB-NOPROTO",
+                               f"{ch.path}: port {w.name} ({ch.btype_name}) has no protocol, "
+                               f"but its members {inner} do; give the port's bundle a "
+                               f"protocol (`fw_bundle_protocol`) or make each a port")
         elif isinstance(ch, FwSignal) and ch.kind == "port":
             sigs.append(ch)
-    return sigs, bundles
+    return sigs, ports
+
+
+def _imports(scan, w: PortWalk, *classes) -> List[str]:
+    """The packages a port's testbench code names: the protocol level's
+    bundle class, the transactor classes, and its payload types'."""
+    known = {p.name for p in scan.rt.comp.getPackages()}
+    out = [ty.package_of(w.levels[0].bundle.btype)]
+    out += [ty.package_of(c) for c in classes if c is not None]
+    out += [q.split("::", 1)[0] for q in (ty.qual_type_name(p.sig.dtype) for p in w.pins)
+            if "::" in q]
+    return [p for p in out if p in known]
 
 
 def _vtype(width: int) -> str:
@@ -146,32 +201,32 @@ def gen_tb(r, scan, top_module: Optional[str] = None, *, clk_half: int = 5,
     bridges, nets = [], []
     dut_conns: List[str] = []
     mdecl, mbuild, mconn = [], [], []
-    for b in bundles:
+    for w in bundles:
+        lvl = w.levels[0]
+        port = w.name
         if bind:
-            m = _find_xtor(scan, b, "monitor")
-            if m is None:
-                raise GenError("FW-E-TB-MON", f"{b.path}: no monitor for {b.btype_name} in the scan")
+            m, mpins, mcls = _xtor_of(scan, w, "monitor")
             need(m)
-            port = "_".join(b.rel_path(r.top))
-            mt = f"fw_monitor #({b.btype_name})"
+            pkgs.extend(_imports(scan, w, mcls))
+            mt = f"fw_monitor #({lvl.bundle.btype_name})"
             mdecl += [f"        {mt} mon_{port}_pins;", f"        {m} mon_{port};"]
             mbuild += [f"            mon_{port}_pins = {mt}::create(\"mon_{port}_pins\", this);",
                        f"            mon_{port} = {m}::create(\"mon_{port}\", this);"]
-            mconn.append(f"            mon_{port}.p.connect(mon_{port}_pins);")
-    for b in bundles:
-        x = _find_xtor(scan, b)
-        if x is None:
-            raise GenError("FW-E-TB-XTOR", f"{b.path}: no transactor for {b.btype_name} ({b.kind}) in the scan")
-        port = "_".join(b.rel_path(r.top))
-        btype = f"{_TB_MIXIN[b.kind]} #({b.btype_name})"
-        need(b.btype_name)
+            mconn.append(f"            mon_{port}.{mpins}.connect(mon_{port}_pins);")
+    for w in bundles:
+        lvl = w.levels[0]
+        x, xpins, xcls = _xtor_of(scan, w)
+        port = w.name
+        btype = f"{_TB_MIXIN[lvl.kind]} #({lvl.bundle.btype_name})"
+        need(lvl.bundle.btype_name)
         need(x)
+        pkgs.extend(_imports(scan, w, xcls))
         xn = f"dut_{port}"
         decl += [f"        {btype} {port};", f"        {x} {xn};"]
         build += [f"            {port} = {btype}::create(\"{port}\", this);",
                   f"            {xn} = {x}::create(\"{xn}\", this);"]
-        conn_pins.append(f"            {xn}.pins.connect_up({port});")
-        api = next(iter(b.proto.apis.values()), None) if b.kind == "bundle" else None
+        conn_pins.append(f"            {xn}.{xpins}.connect_up({port});")
+        api = next(iter(lvl.proto.apis.values()), None) if lvl.kind == "bundle" else None
         if api is not None and api.name.startswith("fw_put_if#("):
             pt = _targ(api.name)
             decl.append(f"        fw_inbox #({pt}) {xn}_rx;")
@@ -180,16 +235,15 @@ def gen_tb(r, scan, top_module: Optional[str] = None, *, clk_half: int = 5,
                       f"            {xn}_e = fw_export #({api.name})::create(\"{xn}_e\", this);",
                       f"            {xn}_e.set_imp({xn}_rx);"]
             conn_x.append(f"            {xn}.p.connect({xn}_e);")
-        elif b.kind == "bundle":
+        elif lvl.kind == "bundle":
             conn_x.append(f"            // {xn}: bind its method port in a subclass's connect()")
-        # pins: tb-side direction is the opposite of the DUT's
-        for s in b.leaves():
-            leaf = "_".join(s.rel_path(r.top))
-            path = ".".join(["top"] + s.rel_path(r.top))
-            dut_in = (s.dir == "out") == (b.kind == "mirror")
-            st = _targ(s.type_name)
-            nets.append(f"    {_vtype(s.width)} {leaf};")
-            if dut_in:
+        # pins: one bridge per leaf; the tb drives what the DUT takes in
+        for p in w.pins:
+            leaf = p.name
+            path = ".".join(["top"] + p.path)
+            st = ty.qual_type_name(p.sig.dtype)
+            nets.append(f"    {_vtype(p.sig.width)} {leaf};")
+            if p.dir != "out":
                 bridges.append(f"    fw_pin_bridge #({st}, \"{path}\") b_{leaf}(.i('0), .o({leaf}));")
             else:
                 bridges.append(f"    fw_pin_bridge #({st}, \"{path}\") b_{leaf}(.i({leaf}), .o());")

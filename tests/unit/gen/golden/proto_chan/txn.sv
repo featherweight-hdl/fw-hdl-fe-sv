@@ -28,7 +28,7 @@ package scenario_gen_pkg;
         diff = " null";
         return 0;
       end
-      if ((t != that.t)) begin
+      if ((t !== that.t)) begin
         diff = {diff, $sformatf(" t: %p != %p", t, that.t)};
       end
       return (diff == "");
@@ -94,7 +94,7 @@ package scenario_gen_pkg;
         diff = " null";
         return 0;
       end
-      if ((t != that.t)) begin
+      if ((t !== that.t)) begin
         diff = {diff, $sformatf(" t: %p != %p", t, that.t)};
       end
       return (diff == "");
@@ -160,7 +160,7 @@ package scenario_gen_pkg;
         diff = " null";
         return 0;
       end
-      if ((t != that.t)) begin
+      if ((t !== that.t)) begin
         diff = {diff, $sformatf(" t: 0x%0h != 0x%0h", t, that.t)};
       end
       return (diff == "");
@@ -226,7 +226,7 @@ package scenario_gen_pkg;
         diff = " null";
         return 0;
       end
-      if ((t != that.t)) begin
+      if ((t !== that.t)) begin
         diff = {diff, $sformatf(" t: %p != %p", t, that.t)};
       end
       return (diff == "");

@@ -29,6 +29,14 @@ class Channel:
     fwd: bool
     family: str                    # fw_rv_if
     payload: ir.DataType           # over the bundle's parameters
+    #: a packed struct payload with a 4-state member: the payload is its
+    #: typedef, by name. The IR models the struct, but class emission does
+    #: not use 4-state, so GenKit makes no helpers and no per-field pins
+    #: and warns (``FW-W-GEN-4STATE``)
+    four_state_struct: bool = False
+    #: the class a payload typedef is declared in (``pkg::bundle::req_t``),
+    #: or ""; GenKit rejects it (``FW-E-GEN-SCOPE``)
+    local_to: str = ""
 
 
 @dc.dataclass
@@ -71,6 +79,10 @@ def _channel(cm, mem, scope) -> Optional[Channel]:
     if family not in CHANNEL_FAMILIES:
         return None
     pt = _type_arg(inner)
+    local_to = _class_scope(cm, pt)
+    if _four_state_struct(pt):
+        return Channel(mem.name, _ROLES[role], family, ir.DataTypeRef(ref_name=str(pt)),
+                       four_state_struct=True, local_to=local_to)
     payload = _map_payload(cm, pt)
     tsyn = _arg_syntax(_arg_syntax(mem.declaredType.typeSyntax))
     if isinstance(payload, ir.DataTypeInt) and tsyn is not None:
@@ -78,16 +90,47 @@ def _channel(cm, mem, scope) -> Optional[Channel]:
         we = width_expr(tsyn, pt, scope)
         if we is not None and not isinstance(we, ir.ExprConstant):
             payload.width_expr = we
-    return Channel(mem.name, _ROLES[role], family, payload)
+    return Channel(mem.name, _ROLES[role], family, payload, local_to=local_to)
+
+
+def _four_state_struct(t) -> bool:
+    """A packed struct (or a typedef of one) with a 4-state member."""
+    c = getattr(t, "canonicalType", t)
+    return bool(getattr(c, "isStruct", False) and getattr(c, "isFourState", False))
+
+
+def _class_scope(cm, t) -> str:
+    """The class a payload typedef ``t`` is declared in (``bundle`` for
+    ``pkg::bundle::req_t``), or "" for a package-level (or unit-level)
+    typedef or a type parameter's alias."""
+    from . import types as ty
+    if not getattr(t, "isAlias", False) or ty._type_param_alias(t):
+        return ""
+    parts = str(getattr(t, "lexicalPath", "") or "").split("::")
+    if len(parts) >= 3:
+        return parts[-2]
+    if len(parts) == 2:
+        comp = getattr(cm, "compilation", None)
+        if comp is not None and comp.getPackage(parts[0]) is None:
+            return parts[0]
+    return ""
+
+
+def has_channels(cls) -> bool:
+    """Whether bundle class ``cls`` (a specialization) has a channel member
+    (``fw_bundle``/``fw_mirror`` of a channel family): the test
+    :func:`bundle_channels` makes, with nothing mapped."""
+    for m in cls:
+        if type(m).__name__ == "ClassPropertySymbol" and \
+                _generic_name(m.type) in _ROLES and \
+                _generic_name(_type_arg(m.type)) in CHANNEL_FAMILIES:
+            return True
+    return False
 
 
 def _map_payload(cm, t) -> Optional[ir.DataType]:
-    """Payload type ``t`` in IR; a 4-state integral (``logic [7:0]``) is
-    accepted, as the pins carry it, and marked ``four_state``."""
-    if t.isIntegral and t.isFourState and not getattr(t, "isAlias", False) \
-            and not t.isStruct:
-        return ir.DataTypeInt(bits=int(t.bitWidth), signed=bool(t.isSigned),
-                              four_state=True)
+    """Payload type ``t`` in IR (zuspec-fe-sv); a 4-state integral
+    (``logic [7:0]``) is marked ``four_state``."""
     return cm._map_type(t)
 
 

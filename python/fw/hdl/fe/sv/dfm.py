@@ -167,8 +167,10 @@ async def GenKit(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
     markers = _diag_markers(r.diags)
     if not r.ok:
         return TaskDataResult(status=1, changed=True, output=[], markers=markers)
+    gen_diags = []
     try:
-        sv = gen_kit(r, pkg_name=p.pkg_name or None)
+        sv = gen_kit(r, pkg_name=p.pkg_name or None, diags=gen_diags)
+        markers += _diag_markers(gen_diags)
     except GenError as e:
         return TaskDataResult(status=1, changed=True, output=[], markers=markers + [_error(str(e))])
     pkg = re.search(r"^package\s+(\w+)\s*;", sv, re.M).group(1)
@@ -212,14 +214,20 @@ async def EmitSV(ctxt: TaskRunCtxt, input: TaskDataInput) -> TaskDataResult:
     rundir = input.rundir
     try:
         res = emit_sv(ctx, top, rundir, extern_files=rtl,
-                      top_module=input.params.top_module or None)
+                      top_module=input.params.top_module or None,
+                      width_params=bool(getattr(input.params, "width_params", False)))
     except Exception as e:   # a pass or the back end rejected the IR
         return TaskDataResult(status=1, changed=True, output=[],
                               markers=[_error(f"{type(e).__name__}: {e}")])
     gen = [str(os.path.relpath(f, rundir)) for f in res.files]
     order = [os.path.relpath(l, rundir) for l in res.filelist.read_text().split()
              if os.path.relpath(l, rundir) in gen]
-    return TaskDataResult(status=0, changed=True, output=_rtl_filesets(input) + [
+    # A type parameter width_params could not lower stays one: say so.
+    kept = [TaskMarker(msg=f"type parameter '{k.type_param}' of '{k.component}' kept: "
+                       f"{k.reason}", severity=SeverityE.Warning)
+            for k in (res.width_params.kept if res.width_params else [])]
+    return TaskDataResult(status=0, changed=True, markers=kept,
+                          output=_rtl_filesets(input) + [
         FileSet(src=input.name, filetype="systemVerilogSource", basedir=rundir, files=order),
         FileSet(src=input.name, filetype="fwHdlFilelist", basedir=rundir,
                 files=[os.path.basename(str(res.filelist))])])

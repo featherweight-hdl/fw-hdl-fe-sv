@@ -34,6 +34,9 @@ def test_std_kit(tmp_path):
     # leaves std's hand-written fw_rv_initiator/target/monitor alone, and the
     # package stays macro-free (unchanged by K9.7).
     assert "_initiator" not in sv and "_target #(" not in sv and "`fw_" not in sv
+    # F8a: fw_mem_if's 4-state defaults are kept, as the API writes them.
+    assert ("class fw_mem_if_proxy #(type ADDR = logic [31:0], type DATA = logic [31:0], "
+            "type STRB = logic [3:0])") in sv
 
     if shutil.which("verilator") is None:
         pytest.skip("verilator not on PATH")
@@ -46,6 +49,8 @@ def test_std_kit(tmp_path):
                   f"  {api}_proxy {spec} p_{i} = new;",
                   f"  {api}_listener_fanout {spec} f_{i} = new;",
                   f"  initial begin chk_{i} c; c = new; end"]
+    # The defaults: a default proxy is a default fw_mem_if.
+    lines += ["  fw_mem_if_proxy p_dflt = new;", "  fw_mem_if m_dflt = p_dflt;"]
     # The runtime pieces: an inbox is both a put and a get endpoint.
     lines += ["  fw_inbox #(int) ib = new;", "  fw_put_if #(int) ib_put = ib;",
               "  fw_get_if #(int) ib_get = ib;",

@@ -112,5 +112,9 @@ package:
         doc: The top module's name (default the top class's name)
         type: str
         value: ""
+      width_params:
+        doc: Lower packed type parameters to int width parameters (``parameter int T_W``) for tools without ``parameter type`` (yosys read -formal, Verilog-2005)
+        type: bool
+        value: false
     shell: pytask
     run: fw.hdl.fe.sv.dfm.EmitSV

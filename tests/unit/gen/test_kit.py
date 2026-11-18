@@ -82,6 +82,65 @@ def test_kit_bundle_channels():
     assert Kit.from_scan(ctx, r.table(), r.api_packages(), r.bundles.values()).bundles == []
 
 
+def _gen(name):
+    diags = []
+    sv = gen_kit(_scan(name), diags=diags)
+    return sv, {d.id: d for d in diags}
+
+
+def test_gen_unspecialized_bundle_warns():
+    # FW-W-GEN-UNSPEC: a parameterized bundle nothing specializes gets no
+    # channel APIs; the warning names it and the fix.
+    sv, diags = _gen("gen_unspec")
+    d = diags["FW-W-GEN-UNSPEC"]
+    assert d.severity == "warning" and d.path == "test_ch_bundle"
+    assert "typedef test_ch_bundle #(" in d.msg
+    assert "test_ch_req_if" not in sv
+    # proto_chan specializes it: no warning.
+    _, diags = _gen("proto_chan")
+    assert "FW-W-GEN-UNSPEC" not in diags
+
+
+def test_gen_4state_struct_payload_warns():
+    # FW-W-GEN-4STATE: the channel API keeps the payload's type (not
+    # ``int``), but there are no helpers.
+    sv, diags = _gen("gen_4state")
+    d = diags["FW-W-GEN-4STATE"]
+    assert d.severity == "warning" and d.path == "fs_bundle.req"
+    assert "scenario::fs_req_t" in d.msg and "bit" in d.msg
+    assert "task req(input scenario::fs_req_t t);" in sv
+    assert "fs_payloads" not in sv
+    # F8a: the IR models the struct, 4-state member included, so the scan
+    # has no FW-W-SCAN-IR warning; class emission still does not use it.
+    assert "FW-W-SCAN-IR" not in diags
+    ctx, _ = _scan("gen_4state").to_ir()
+    st = ctx.type_m["scenario::fs_req_t"]
+    assert [(f.name, f.datatype.four_state) for f in st.fields] == [
+        ("code", True), ("tag", False)]
+
+
+def test_gen_class_local_payload_rejected():
+    with pytest.raises(GenError) as e:
+        gen_kit(_scan("gen_scope"), diags=[])
+    assert e.value.code == "FW-E-GEN-SCOPE"
+    assert "ls_bundle::req_t" in str(e.value) and "package level" in str(e.value)
+
+
+def test_gen_pkg_std_apis_only():
+    # A kit whose only API is std's (with a builtin payload) is the
+    # protocol's package, not std's; it has nothing to generate.
+    sv, diags = _gen("gen_stdonly")
+    assert "package scenario_gen_pkg;" in sv and "class" not in sv
+    assert not diags
+
+
+def test_gen_pkg_protocol_outside_package():
+    with pytest.raises(GenError) as e:
+        gen_kit(_scan("gen_unit"), diags=[])
+    assert e.value.code == "FW-E-GEN-PKG"
+    assert "'so_proto' is declared outside a package" in str(e.value)
+
+
 def test_gen_version():
     assert len(GEN_VERSION) == 16
 

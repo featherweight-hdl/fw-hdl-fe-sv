@@ -9,6 +9,7 @@ from typing import List, Optional, Sequence
 import zuspec.ir.core as ir
 from zuspec.be.sv import SVGenerator
 from zuspec.be.sv.structural import sv_module_name, write_filelist
+from zuspec.ir.core.xf import TypeParamWidthReport, lower_type_params_to_widths
 from zuspec.synth.passes.struct_flatten import flatten_structure
 
 
@@ -18,14 +19,20 @@ class EmitResult:
     filelist: Path              # extern RTL first, then the types package, then the
                                 # generated modules, children first
     top_module: str
+    width_params: Optional[TypeParamWidthReport] = None  # with width_params=True
 
 
 def emit_sv(ctxt: ir.Context, top: str, out_dir, *, extern_files: Sequence[str] = (),
-            top_module: Optional[str] = None, filelist: str = "files.f") -> EmitResult:
+            top_module: Optional[str] = None, filelist: str = "files.f",
+            width_params: bool = False) -> EmitResult:
     """Flatten ``ctxt`` in place and write one ``.sv`` per generated module
     into ``out_dir``, plus ``<top>_types_pkg.sv`` when ports use packed
     structs or enums the RTL does not declare, plus a filelist.
-    ``top_module`` renames the top."""
+    ``top_module`` renames the top. ``width_params`` first runs Zuspec's
+    :class:`~zuspec.ir.core.xf.TypeParamWidthPass`, so packed type
+    parameters become int width parameters (``parameter int T_W``) for
+    tools without ``parameter type`` (yosys ``read -formal``); the ones it
+    keeps are in ``EmitResult.width_params.kept``."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if top_module and top_module != top:
@@ -37,10 +44,11 @@ def emit_sv(ctxt: ir.Context, top: str, out_dir, *, extern_files: Sequence[str] 
                 if isinstance(f.datatype, ir.DataTypeRef) and f.datatype.ref_name == top:
                     f.datatype.ref_name = top_module
         top = top_module
+    wp = lower_type_params_to_widths(ctxt) if width_params else None
     flatten_structure(ctxt, top=top)
     # The packed structs and enums the ports use: one package, named after
     # the top (§6.5).
     pkg = f"{sv_module_name(top)}_types_pkg"
     files = [Path(f) for f in SVGenerator(out, types_package=pkg).generate(ctxt)]
     fl = write_filelist(out / filelist, files, [str(Path(f).resolve()) for f in extern_files], ctxt)
-    return EmitResult(files, fl, top)
+    return EmitResult(files, fl, top, wp)

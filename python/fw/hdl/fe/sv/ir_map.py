@@ -526,6 +526,7 @@ class IrMapper:
         self._diag_keys: set = set()
         self._vtypes: Dict[str, str] = {}     # value type signature -> type_m key
         self._anon = 0
+        self._mapper = None                   # zuspec-fe-sv SVMapper, for API classes
 
     def run(self) -> Tuple[ir.Context, str]:
         top = self._component(self.rt.top)
@@ -620,9 +621,28 @@ class IrMapper:
                 fields.append(_port(ch, self._sig_type(ch, scope)))
         tps = self._class_tparams(b.btype, b.tr) if generic else []
         t = ir.DataTypeBundle(name=b.btype_name, super=None, fields=fields,
-                              template_params=tps)
+                              template_params=tps,
+                              bundle_protocol=self._bundle_proto(b, tps))
         base = _base_name(b.btype) if generic else b.btype_name
         return self._intern(base, t, "bundle")
+
+    def _bundle_proto(self, b: FwBundle, tps) -> Optional[ir.ProtocolRef]:
+        """The protocol of ``b``'s class. In a generic bundle type (template
+        params ``tps``), a protocol parameter that the class's
+        ``fw_bundle_protocol(PROTO)`` passes one of those parameters by
+        name is written as it; any other is its value here."""
+        rec = getattr(b, "proto", None)
+        if rec is None:
+            return None
+        ref = _proto_ref(rec)
+        names = {tp.name: tp for tp in tps}
+        for k, a in _proto_args(self.rt, b.btype, list(rec.params)).items():
+            tp = names.get(a)
+            if tp is not None and k in ref.params:
+                ref.params[k] = (ir.DataTypeRef(ref_name=a)
+                                 if isinstance(tp, ir.TemplateParamType)
+                                 else ir.ExprRefParam(name=a))
+        return ref
 
     def _bundle_field(self, b: FwBundle, o, genvars=(), name: Optional[str] = None,
                       array: Optional[ir.DataTypeArray] = None) -> ir.Field:
@@ -1541,8 +1561,29 @@ class IrMapper:
                 hub.apis.append(ir.ProtocolApi(
                     api=api, dir=ir.ProtoDir.REQ if d == 0 else ir.ProtoDir.RSP))
                 if api not in self.ctxt.type_m:
-                    self.ctxt.type_m[api] = ir.DataTypeProtocol(name=api)
+                    self._api_type(r.apis[d].cls, api)
             self.ctxt.type_m[fam] = hub
+        if self._mapper is not None:
+            for k, t in self._mapper.get_types().items():
+                self.ctxt.type_m.setdefault(k, t)
+            self.diags.extend(Diag("FW-W-SCAN-IR", "<ir>", str(e).strip(), "warning")
+                              for e in self._mapper.error_reporter.errors)
+
+    def _api_type(self, cls, name: str) -> None:
+        """``type_m[name]``: API class ``cls`` as zuspec-fe-sv's class mapper
+        writes it (as ``scan.ScanResult.to_ir``): a ``DataTypeProtocol``
+        with its methods or, for a parameterized API, a
+        ``DataTypeParameterized`` over one, written over its own
+        parameters."""
+        if self._mapper is None:
+            from zuspec.fe.sv.mapper import SVMapper
+            self._mapper = SVMapper()
+            self._mapper.class_mapper.compilation = self.rt.comp
+            self._mapper.function_mapper.compilation = self.rt.comp
+        cm = self._mapper.class_mapper
+        g = getattr(ty.canon(cls), "genericClass", None)
+        t = cm.map_generic_api(g) if g is not None else cm.map_protocol(ty.canon(cls), name)
+        self.ctxt.type_m[name] = t if t is not None else ir.DataTypeProtocol(name=name)
 
     def _protocols(self, c: FwComponent, t: ir.DataTypeComponent,
                    general: bool = False) -> None:
@@ -1580,7 +1621,8 @@ class IrMapper:
                 a = ty.type_param(ch.cls, "OUT" if ch.sock else "API")
                 t.api_endpoints.append(ir.ApiEndpoint(
                     name=".".join(ch.rel_path(c)), kind=kind,
-                    api=_base_name(a) if a is not None else None))
+                    api=_base_name(a) if a is not None else None,
+                    imp=(self._obj_path(c, ch.imp) or []) if ch.imp is not None else []))
             elif isinstance(ch, FwCfg):
                 dt = self._type(ty.type_param(ch.cls, "T"))
                 lst = t.cfg_publishers if ch.kind == CFG_PUB else t.cfg_consumers
@@ -1596,7 +1638,36 @@ class IrMapper:
             elif b.kind == "cfg":
                 t.cfg_connections.append(ir.CfgConnection(
                     publisher=b.a.rel_path(c), consumer=b.b.rel_path(c),
-                    derived=False))      # no derived cfg binding
+                    derived=False))
+        # A sink's resolved source (FeRt.check_cfg), where no one call bound
+        # the two: derived, in the scope that holds both.
+        explicit = {(id(b.a), id(b.b)) for b in rt.binds if b.kind == "cfg"}
+        for s in sorted((o for o in rt._by_sv.values()
+                         if isinstance(o, (FwCfg, FwEndpoint)) and o.src is not None),
+                        key=lambda o: o.seq):
+            if (id(s.src), id(s)) not in explicit and _common_scope(s, s.src) is c:
+                t.cfg_connections.append(ir.CfgConnection(
+                    publisher=s.src.rel_path(c), consumer=s.rel_path(c), derived=True))
+        for x in rt.listens:
+            if x.scope is c:
+                t.cfg_listeners.append(ir.CfgListener(
+                    sink=x.sink.rel_path(c), listener=self._obj_path(c, x.listener)))
+
+    def _obj_path(self, c: FwComponent, obj) -> Optional[List[str]]:
+        """The path from ``c`` of SV object ``obj`` (an implementation,
+        a listener): an fw object below ``c`` by its path (``[]``: ``c``),
+        any other object by the member of ``c`` that holds it; None when
+        neither reaches it (a local, an object outside ``c``)."""
+        o = self.rt.fw(obj)
+        if o is not None:
+            try:
+                return o.rel_path(c)
+            except ValueError:
+                return None
+        for sym, v in getattr(c.sv, "fields", {}).items():
+            if strip(v) is obj:
+                return [sym.name]
+        return None
 
     def _port_names(self) -> None:
         """Each kind's ``K::port_name(assoc, attr)`` for every association
@@ -2028,12 +2099,70 @@ def _key(t) -> list:
         out.append([[x.name, _ekey(x.cfg_type)] for x in t.cfg_consumers])
         out.append([[_pkey(x.publisher), _pkey(x.consumer), x.derived]
                     for x in t.cfg_connections])
+        out.append([[_pkey(x.sink), None if x.listener is None else _pkey(x.listener)]
+                    for x in t.cfg_listeners])
+    if isinstance(t, ir.DataTypeBundle):
+        out.append(_ekey(t.bundle_protocol))
     if isinstance(t, ir.DataTypeExtern):
         out.append([t.extern_name, {k: _ekey(v) for k, v in t.extern_params.items()},
                     [[p.name, p.path, _ekey(p.tie), p.open, _ekey(p.datatype),
                       p.domain_kind, _dkey(p.domain), _dmap(p.domain_attr), p.output]
                      for p in t.pins]])
     return out
+
+
+def _common_scope(a: FwObject, b: FwObject) -> Optional[FwComponent]:
+    """The innermost component that holds both ``a`` and ``b``."""
+    up = set()
+    o = b
+    while o is not None:
+        up.add(id(o))
+        o = o.parent
+    o = a
+    while o is not None and not (isinstance(o, FwComponent) and id(o) in up):
+        o = o.parent
+    return o
+
+
+def _proto_args(rt, btype, names: List[str]) -> Dict[str, str]:
+    """The protocol parameters (``names``, in order) that bundle class
+    ``btype``'s ``fw_bundle_protocol(PROTO)`` passes as a bare name, by
+    parameter: ``test_rv_proto #(W)`` -> ``{"W": "W"}``. From the syntax
+    of ``__fw_bundle_protocol``'s return."""
+    sub = rt.interp.find_method(ty.canon(btype), "__fw_bundle_protocol")
+    expr = getattr(getattr(sub, "body", None), "expr", None)
+    pva = _find_syntax(getattr(expr, "syntax", None), "ParameterValueAssignment")
+    out: Dict[str, str] = {}
+    if pva is None:
+        return out
+    i = 0
+    for a in _syntax_children(pva):
+        k = a.kind.name
+        if k == "OrderedParamAssignment":
+            if i < len(names) and re.fullmatch(r"\w+", str(a.expr).strip()):
+                out[names[i]] = str(a.expr).strip()
+            i += 1
+        elif k == "NamedParamAssignment" and a.expr is not None:
+            if re.fullmatch(r"\w+", str(a.expr).strip()):
+                out[a.name.valueText] = str(a.expr).strip()
+    return out
+
+
+def _syntax_children(n):
+    return [c for c in n if type(c).__name__ != "Token" and hasattr(c, "kind")]
+
+
+def _find_syntax(n, kind: str):
+    """The first node of syntax kind ``kind`` in ``n``, depth first."""
+    if n is None:
+        return None
+    if n.kind.name == kind:
+        return n
+    for c in _syntax_children(n):
+        r = _find_syntax(c, kind)
+        if r is not None:
+            return r
+    return None
 
 
 def _proto_ref(rec) -> ir.ProtocolRef:

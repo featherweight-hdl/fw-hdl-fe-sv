@@ -50,13 +50,12 @@ def _sprint(n: str, t: ir.DataTypeRef, names: List[str]) -> ir.Function:
 
 
 def _compare(n: str, t: ir.DataTypeRef, names: List[str]) -> ir.Function:
-    # Guess: ``!=`` (be-sv has no ``!==``); a 4-state field holding X or Z
-    # compares unknown, so is not reported.
+    # ``!==``: a 4-state field holding X or Z is reported.
     a, b, diff = irb.ref("a"), irb.ref("b"), irb.ref("diff")
     body: List[ir.Stmt] = [irb.assign(diff, irb.const(""))]
     for f in names:
         fa, fb = irb.attr(a, f), irb.attr(b, f)
-        ne = ir.ExprCompare(left=fa, ops=[ir.CmpOp.NotEq], comparators=[fb])
+        ne = irb.ne(fa, fb)
         msg = _fmt([irb.const(f" {f}: 0x%0h != 0x%0h"), fa, fb])
         body.append(irb.if_(ne, [irb.assign(diff, ir.ExprConcat(values=[diff, msg]))]))
     body.append(irb.ret(irb.eq(diff, irb.const(""))))

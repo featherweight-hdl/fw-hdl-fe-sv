@@ -93,7 +93,7 @@ def _compare_proto(base_ref: ir.DataType) -> ir.Function:
 
 def _compare(m: str, cls_ref: ir.DataType, base_ref: ir.DataType,
              fields: List[ir.Field]) -> ir.Function:
-    # Guess: ``!=`` as in payloads (gap G7): an X or Z field is not reported.
+    # ``!==`` as in payloads: an X or Z field is reported.
     that, diff = irb.ref(_THAT), irb.ref("diff")
     cast = ir.ExprCall(func=ir.ExprRefUnresolved(name="$cast"), args=[that, irb.ref("o")])
     body: List[ir.Stmt] = [
@@ -105,7 +105,7 @@ def _compare(m: str, cls_ref: ir.DataType, base_ref: ir.DataType,
             irb.assign(diff, irb.const(" null")), irb.ret(irb.const(0))])]
     for f in fields:
         a, b, s = irb.ref(f.name), irb.attr(that, f.name), _spec(f.datatype)
-        ne = ir.ExprCompare(left=a, ops=[ir.CmpOp.NotEq], comparators=[b])
+        ne = irb.ne(a, b, f.datatype)
         msg = _fmt([irb.const(f" {f.name}: {s} != {s}"), a, b])
         body.append(irb.if_(ne, [irb.assign(diff, ir.ExprConcat(values=[diff, msg]))]))
     body.append(irb.ret(irb.eq(diff, irb.const(""))))

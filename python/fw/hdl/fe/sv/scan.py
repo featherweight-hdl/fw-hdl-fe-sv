@@ -40,6 +40,9 @@ class ScanResult:
     #: name: a kit's APIs, whether or not a protocol uses them (std's
     #: neutral APIs use none). Generic ones are the generic class.
     apis: Dict[str, Any] = dc.field(default_factory=dict)
+    #: the parameterized classes declared in the sources' packages, by
+    #: name (the generic class): for :meth:`unspecialized_bundles`.
+    generics: Dict[str, Any] = dc.field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -57,6 +60,11 @@ class ScanResult:
         ``None`` if there is none among the scanned classes."""
         return find_xtor(self.table(), bundle, kind)
 
+    def xtor_class(self, type_name: str) -> Any:
+        """The class of converter ``type_name`` (as :meth:`xtor_for` spells
+        it), or None."""
+        return self.rt.proto._conv_cls.get(type_name) if self.rt is not None else None
+
     def api_packages(self) -> List[str]:
         """The packages the protocols' API classes are declared in (from
         their generic class, if parameterized), in order found."""
@@ -71,6 +79,44 @@ class ScanResult:
             path = str(getattr(c, "lexicalPath", ""))
             if "::" in path and path.split("::", 1)[0] not in out:
                 out.append(path.split("::", 1)[0])
+        return out
+
+    def proto_packages(self) -> Dict[str, Optional[str]]:
+        """Each protocol (generic name) and bundle class found -> the
+        package it is declared in, None if in no package."""
+        out: Dict[str, Optional[str]] = {}
+        for rec in (self.rt.proto.recs.values() if self.rt is not None else []):
+            for c in [rec.cls] + list(rec.bundle_cls.values()):
+                g = getattr(c, "genericClass", None) or c
+                out.setdefault(g.name, ty.package_of(c))
+        return out
+
+    def unspecialized_bundles(self) -> List[str]:
+        """The parameterized bundle classes with channel members declared in
+        the sources' packages that the source never specializes: a scan
+        sees a parameterized class only through a specialization, so these
+        get no channel APIs and no transactors."""
+        from zuspec.fe.sv.class_mapper import _default_specialization
+        from .channels import has_channels
+        if self.rt is None:
+            return []
+        seen = {getattr(getattr(c, "genericClass", None), "name", None)
+                for rec in self.rt.proto.recs.values() for c in rec.bundle_cls.values()}
+        out = []
+        for name, g in self.generics.items():
+            if name in seen:
+                continue
+            try:
+                spec = _default_specialization(g)
+            except Exception:                   # pragma: no cover
+                spec = None
+            if spec is None:
+                # No defaults to specialize with: judge from the source text.
+                txt = str(g.getSyntax() if hasattr(g, "getSyntax") else "")
+                if "fw_bundle_protocol" in txt:
+                    out.append(name)
+            elif ty.find_member(spec, "__fw_bundle_protocol")[0] and has_channels(spec):
+                out.append(name)
         return out
 
     def api_homes(self) -> Dict[str, str]:
@@ -92,7 +138,7 @@ class ScanResult:
         ``DataTypeProtocol`` (zuspec-fe-sv ``map_generic_api``); then the
         named types their
         methods use (zuspec-fe-sv ``SVMapper``). A type the mapper rejects
-        (a 4-state payload) is a warning: the protocols table stands."""
+        (an unsupported one) is a warning: the protocols table stands."""
         import zuspec.ir.core as ir
         from zuspec.fe.sv.mapper import SVMapper
         m = SVMapper()
@@ -159,6 +205,7 @@ def scan(files: Sequence[str], incdirs: Sequence[str] = (),
     rt.interp = Interpreter(comp, FeIntrinsics(rt))
     s = _Scan(rt)
     apis: Dict[str, Any] = {}
+    generics: Dict[str, Any] = {}
     # std's own APIs only when std is what is scanned.
     std = os.path.realpath(api.std_file)
     skip = {ty.API_PACKAGE, "std"}
@@ -170,16 +217,35 @@ def scan(files: Sequence[str], incdirs: Sequence[str] = (),
                 if getattr(m, "isInterface", False) and type(m).__name__ in (
                         "GenericClassDefSymbol", "ClassType"):
                     apis[m.name] = m
+                elif type(m).__name__ == "GenericClassDefSymbol":
+                    generics[m.name] = m
                 s.visit_type(m)
     for unit in comp.getCompilationUnits():
         for m in unit:
             s.visit_type(m)
-    return ScanResult(rt, rt.diags, s.order, apis=apis)
+    return ScanResult(rt, rt.diags, s.order, apis=apis, generics=generics)
+
+
+def register_named(rt: FeRt) -> None:
+    """Register every converter class the design names: the classes a
+    scan visits in the elaborated sources' packages (not the API's), as
+    rt-sv's image registers each class it holds. Only converters: no
+    protocol or bundle is registered by the walk itself. For the
+    ``abstractors()`` and ``abstractor_for`` queries."""
+    s = _Scan(rt, converters_only=True)
+    for pkg in rt.comp.getPackages():
+        if pkg.name not in (ty.API_PACKAGE, "std"):
+            for m in pkg:
+                s.visit_type(m)
+    for unit in rt.comp.getCompilationUnits():
+        for m in unit:
+            s.visit_type(m)
 
 
 class _Scan:
-    def __init__(self, rt: FeRt):
+    def __init__(self, rt: FeRt, converters_only: bool = False):
         self.rt = rt
+        self.converters_only = converters_only
         self.seen: set = set()
         self.order: List[str] = []
         self.base_only: set = set()
@@ -227,6 +293,8 @@ class _Scan:
             self.visit_class(base, as_base=True)
 
     def bundle(self, cls, name: str) -> None:
+        if self.converters_only:
+            return
         try:
             self.rt.proto.bundle_class(cls, name)
         except (ElabError, InterpError) as e:
@@ -235,7 +303,7 @@ class _Scan:
     def register(self, cls, name: str) -> None:
         p = self.rt.proto
         try:
-            if ty.api_base(cls, ("fw_protocol",)) and \
+            if not self.converters_only and ty.api_base(cls, ("fw_protocol",)) and \
                     ty.find_member(cls, "get_type")[0]:
                 p.check_this(cls)
                 p._static(cls, "get_type")

@@ -27,7 +27,7 @@ from . import values as vx
 from .params import ParamArg
 from .objects import (BUNDLE, CFG_CONS, CFG_PUB, COMPONENT, MIRROR, MONITOR, Assoc, Binding, Conn,
                       Diag, ExternRec, FwBundle, FwCfg, FwComponent, FwEndpoint, FwObject, FwSignal,
-                      PinRule, Tie)
+                      Listen, PinRule, Tie)
 
 _SIGNAL_DIR = {"fw_signal": None, "fw_input": "in", "fw_output": "out", "fw_inout": "inout"}
 _PROTO_API = {"fw_protocol_type_of", "fw_api_type_of", "fw_protocol_decl", "fw_protocol_family",
@@ -90,6 +90,7 @@ class FeRt:
         # connect sink side -> source side, over plain and configured ones.
         self.cfg_up: Dict[int, FwObject] = {}
         self.cfg_src: Dict[int, FwObject] = {}
+        self.listens: List[Listen] = []       # add_listener, in call order
         self.overrides: List[Override] = []
         self.diags: List[Diag] = []
         self._by_sv: Dict[int, FwObject] = {}
@@ -348,6 +349,13 @@ class FeRt:
         self._register(e)
         return sv
 
+    def set_imp(self, e_sv, imp) -> None:
+        """``set_imp(imp)``: recorded on the endpoint, for the IR's
+        ``ApiEndpoint.imp``."""
+        e = self._used(unwrap(e_sv), "an endpoint")
+        if e is not None:
+            e.imp = unwrap(imp)
+
     def link(self, a_sv, b_sv, up: bool) -> None:
         """``connect`` (up False) or ``connect_up``: binds ``a`` to ``b``;
         a configured endpoint's also records the cfg binding."""
@@ -422,6 +430,17 @@ class FeRt:
         if p.value is None:
             raise ElabError(f"{p.path}: get() before set()")
         return p.value
+
+    def add_listener(self, s_sv, l_sv) -> None:
+        """``add_listener(l)`` on a sink: recorded for the IR's
+        ``cfg_listeners`` (Q2: static elaboration connects a change to its
+        action; it neither pushes values nor calls ``changed``)."""
+        s = self._used(unwrap(s_sv), "a cfg sink")
+        l = unwrap(l_sv)
+        if s is None or l is None:
+            raise ElabError("add_listener: the sink or the listener is null")
+        if self.current is not None:
+            self.listens.append(Listen(self.current, s, l))
 
     @staticmethod
     def _is_src(o) -> bool:
@@ -922,8 +941,10 @@ class FeIntrinsics(Intrinsics):
                 return rt.create_endpoint(owner, api, a[0], a[1])
             if name in ("connect", "connect_up"):
                 return rt.link(this, a[0], name == "connect_up")
-            if name in ("set_imp", "add_listener"):
-                return None
+            if name == "set_imp":
+                return rt.set_imp(this, a[0])
+            if name == "add_listener":
+                return rt.add_listener(this, a[0])
             if name == "set" and api in _CFG_EP:
                 return rt.cfg_set(this, a[0])
             if name == "get" and api in _CFG_EP:
@@ -938,7 +959,7 @@ class FeIntrinsics(Intrinsics):
             if name in ("connect", "connect_up"):
                 return rt.cfg_link(this, a[0], name == "connect_up")
             if name == "add_listener":
-                return None
+                return rt.add_listener(this, a[0])
         elif api in _ROLE:
             if name == "create":
                 return rt.create_bundle(owner, api, a[0], a[1])
@@ -1060,8 +1081,9 @@ class FeIntrinsics(Intrinsics):
         if api in ("fw_api_type", "fw_api_type_of") and name in ("name", "family", "protocols"):
             return p.api_query(this, name)
         if api in ("fw_protocol_type", "fw_protocol_type_of") and name != "get":
-            r = p.protocol_query(this, name, a)
-            return NOT_HANDLED if name in ("xtors", "abstractors") else r
+            if name == "abstractors":
+                return p.abstractors(this)
+            return p.protocol_query(this, name, a)
         if api == "fw_protocol":
             if name == "declare":
                 return None           # the default: no APIs
@@ -1069,6 +1091,8 @@ class FeIntrinsics(Intrinsics):
                 return p.of(a[0])
             if name == "role_of":
                 return p.role_of(a[0])
+            if name == "abstractor_for":
+                return p.abstractor_for(a[0], a[1])
         return NOT_HANDLED
 
     def call(self, interp, sub, this, args, named=None):

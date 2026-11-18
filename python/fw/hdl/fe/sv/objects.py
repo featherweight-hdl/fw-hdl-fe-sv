@@ -224,7 +224,8 @@ class FwEndpoint(FwObject):
     ``peer``: a socket's peer socket (connect, both ways). A configured
     endpoint (``fw_port_cfg_src`` and the rest) has ``cfg`` "src" or
     "sink", ``tkey`` (the spelling of CFG), and, as a source, ``value``
-    (its last ``set()``); a sink's ``src`` is the source it resolves to."""
+    (its last ``set()``); a sink's ``src`` is the source it resolves to.
+    ``imp``: what ``set_imp`` was given (an SV object), or None."""
     kind: str = API
     out: bool = False
     sock: bool = False
@@ -236,6 +237,7 @@ class FwEndpoint(FwObject):
     tkey: str = ""
     value: Any = None
     src: Optional[FwObject] = None
+    imp: Any = None
 
 
 @dc.dataclass(eq=False)
@@ -257,6 +259,16 @@ class Binding:
     b: FwObject
     scope: Optional["FwComponent"]
     up: bool = False
+
+
+@dc.dataclass
+class Listen:
+    """``sink.add_listener(listener)`` (``listener`` an SV object), made in
+    ``scope``'s code: the listener's ``changed`` runs on each change that
+    reaches ``sink``. Recorded, never run (no value is pushed statically)."""
+    scope: "FwComponent"
+    sink: FwObject
+    listener: Any
 
 
 @dc.dataclass

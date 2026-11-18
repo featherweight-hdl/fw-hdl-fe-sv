@@ -8,8 +8,8 @@ module rv_formal(input logic clk);
   (* anyseq *) logic [7:0] data;
   (* anyconst *) logic [3:0] idx;
   logic fire, first;
-  fw_rv_mon_core #(.W(8)) dut(.clk(clk), .p_valid(valid), .p_ready(ready), .p_data(data),
-                              .fire(fire), .first(first));
+  fw_rv_mon_core #(.T_W(8)) dut(.clk(clk), .p_valid(valid), .p_ready(ready), .p_data(data),
+                                .fire(fire), .first(first));
   reg f_past = 0, open = 0;
   reg [3:0] n = 0;
   reg [7:0] d0 = 0;

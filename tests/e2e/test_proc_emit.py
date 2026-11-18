@@ -39,7 +39,7 @@ def _root_clocks(ctxt, top):
             if d.kind == "fw_clock_kind" and d.deriv == "root"}
 
 
-def _emit(tmp_path, name, src=None):
+def _emit(tmp_path, name, src=None, **kw):
     """Lowers scenario ``name``, or the source ``src`` in its directory."""
     sc = spec_dir() / "conformance" / name
     r = elaborate([str(src or sc / "top.sv")], top="scenario::top",
@@ -48,7 +48,7 @@ def _emit(tmp_path, name, src=None):
     ctxt, top = r.to_ir()
     assert r.ir_diags == []
     clocks = _root_clocks(ctxt, top)  # before emit_sv renames the types
-    return ctxt, clocks, emit_sv(ctxt, top, tmp_path / "gen", top_module="ptop")
+    return ctxt, clocks, emit_sv(ctxt, top, tmp_path / "gen", top_module="ptop", **kw)
 
 
 def test_counter_blocks(tmp_path):
@@ -146,7 +146,7 @@ endmodule
     return got
 
 
-def _mon_core(tmp_path):
+def _mon_core(tmp_path, **kw):
     """Lowers proc_rv with a std ``fw_rv_mon_core`` m tapping its link."""
     sc = spec_dir() / "conformance" / "proc_rv"
     src = (sc / "top.sv").read_text()
@@ -158,7 +158,7 @@ def _mon_core(tmp_path):
         assert old in src
         src = src.replace(old, new)
     (tmp_path / "top.sv").write_text(src)
-    return _emit(tmp_path, "proc_rv", tmp_path / "top.sv")
+    return _emit(tmp_path, "proc_rv", tmp_path / "top.sv", **kw)
 
 
 @needs_verilator
@@ -218,13 +218,14 @@ def test_rv_formal(tmp_path):
     """The lowered ``fw_rv_mon_core`` proves the monitor's contract by BMC
     (depth 20, ``smtbmc z3``) in a harness with free pins
     (sv/rv_formal.sv), and covers a stalled beat being accepted."""
-    _, _, res = _mon_core(tmp_path)
-    # yosys has no type parameters: the payload becomes a width parameter.
+    # yosys has no type parameters: Zuspec's TypeParamWidthPass makes the
+    # payload type T a width parameter T_W.
+    _, _, res = _mon_core(tmp_path, width_params=True)
+    assert [(w.component, w.type_param, w.width_param) for w in res.width_params.lowered] \
+        == [("fw_rv_mon_core", "T", "T_W")] and res.width_params.kept == []
     text = (res.files[0].parent / "fw_rv_mon_core.sv").read_text()
-    for old, new in [("parameter type T = bit", "parameter int W = 1"),
-                     ("input T p_data", "input logic [W-1:0] p_data")]:
-        assert old in text, text
-        text = text.replace(old, new)
+    assert "parameter int T_W = 1" in text and "input logic [T_W-1:0] p_data" in text, text
+    assert "parameter type" not in text, text
     f = tmp_path / "formal"
     f.mkdir()
     (f / "fw_rv_mon_core.sv").write_text(text)

@@ -11,10 +11,10 @@ package scenario_gen_pkg;
   
     static function bit test_ch_rsp_compare(input scenario::test_ch_rsp_t a, input scenario::test_ch_rsp_t b, output string diff);
       diff = "";
-      if ((a.code != b.code)) begin
+      if ((a.code !== b.code)) begin
         diff = {diff, $sformatf(" code: 0x%0h != 0x%0h", a.code, b.code)};
       end
-      if ((a.tag != b.tag)) begin
+      if ((a.tag !== b.tag)) begin
         diff = {diff, $sformatf(" tag: 0x%0h != 0x%0h", a.tag, b.tag)};
       end
       return (diff == "");
